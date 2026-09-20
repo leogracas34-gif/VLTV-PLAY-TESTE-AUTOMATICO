@@ -4,15 +4,23 @@ import android.app.UiModeManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ActivityInfo
+import android.content.res.ColorStateList
 import android.content.res.Configuration
+import android.graphics.Color
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.provider.Settings
 import android.text.InputType
+import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
+import android.view.ViewGroup
 import android.view.inputmethod.EditorInfo
+import android.widget.FrameLayout
+import android.widget.LinearLayout
+import android.widget.ProgressBar
+import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.view.WindowCompat
@@ -134,13 +142,64 @@ class LoginActivity : AppCompatActivity() {
             verificarEIniciarRapido(savedDns, savedUser, savedPass)
         } else {
             // ✅ ANTES: caía direto em setupUI() (tela de login manual).
-            // AGORA: tenta primeiro o teste automático em segundo plano;
-            // só mostra a tela de login manual se o teste automático falhar
-            // por qualquer motivo (sem internet, servidor fora do ar,
-            // credenciais do teste inválidas etc.) — ver iniciarTesteAutomatico().
-            binding.root.visibility = View.INVISIBLE
+            // AGORA: tenta primeiro o teste automático em segundo plano.
+            // Enquanto isso roda, mostra um overlay com aviso ("Preparando
+            // seu teste...") em vez de deixar a tela em branco — só some
+            // quando o app já está entrando (nesse caso a Activity é
+            // encerrada) ou quando falha e volta pro login manual.
+            mostrarOverlayTesteAutomatico()
             iniciarTesteAutomatico()
         }
+    }
+
+    // ============================================================================
+    // ✅ NOVO: overlay "Preparando seu teste..." — cobre a tela inteira
+    // enquanto o teste automático roda (chamada ao servidor + busca de DNS),
+    // pra não deixar a 1ª abertura do app com a tela em branco. Adicionado
+    // por cima do layout via addContentView(), então funciona sem precisar
+    // mexer no activity_login.xml nem conhecer sua estrutura interna.
+    // ============================================================================
+    private var overlayTesteAutomatico: View? = null
+
+    private val Int.dpToPx: Int get() = (this * resources.displayMetrics.density).toInt()
+
+    private fun mostrarOverlayTesteAutomatico() {
+        if (overlayTesteAutomatico != null) return
+
+        val progress = ProgressBar(this).apply {
+            isIndeterminate = true
+            indeterminateTintList = ColorStateList.valueOf(Color.WHITE)
+        }
+
+        val texto = TextView(this).apply {
+            text = "Preparando seu teste..."
+            textSize = 14f
+            setTextColor(Color.parseColor("#CCCCCC"))
+            gravity = Gravity.CENTER
+        }
+
+        val conteudo = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
+            addView(progress, LinearLayout.LayoutParams(40.dpToPx, 40.dpToPx).apply { bottomMargin = 16.dpToPx })
+            addView(texto)
+        }
+
+        val overlay = FrameLayout(this).apply {
+            layoutParams = ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+            setBackgroundColor(Color.parseColor("#080810")) // mesmo fundo escuro usado no resto do app
+            addView(conteudo, FrameLayout.LayoutParams(FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.CENTER))
+        }
+
+        addContentView(overlay, ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+        overlayTesteAutomatico = overlay
+    }
+
+    // Remove o overlay — chamado só no caminho de falha (o caminho de
+    // sucesso encerra esta Activity antes de precisar disso).
+    private fun esconderOverlayTesteAutomatico() {
+        overlayTesteAutomatico?.let { (it.parent as? ViewGroup)?.removeView(it) }
+        overlayTesteAutomatico = null
     }
 
     // ✅ NOVO: resolve o caso "desinstalei o app, reinstalei, e o login
@@ -337,7 +396,7 @@ class LoginActivity : AppCompatActivity() {
 
             val credenciais = solicitarTesteAutomatico(androidId)
             if (credenciais == null) {
-                withContext(Dispatchers.Main) { setupUI() }
+                withContext(Dispatchers.Main) { esconderOverlayTesteAutomatico(); setupUI() }
                 return@launch
             }
             val (user, pass) = credenciais
@@ -358,7 +417,7 @@ class LoginActivity : AppCompatActivity() {
                 // Teste recebido do servidor não bateu em nenhum DNS (pode
                 // acontecer com um teste antigo/expirado reaproveitado após
                 // logout) — não trava o cliente, só mostra o login manual.
-                withContext(Dispatchers.Main) { setupUI() }
+                withContext(Dispatchers.Main) { esconderOverlayTesteAutomatico(); setupUI() }
                 return@launch
             }
 
