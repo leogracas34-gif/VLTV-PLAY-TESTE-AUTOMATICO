@@ -7,6 +7,8 @@ import android.content.pm.ActivityInfo
 import android.content.res.ColorStateList
 import android.content.res.Configuration
 import android.graphics.Color
+import android.graphics.drawable.GradientDrawable
+import android.net.Uri
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -509,6 +511,17 @@ class LoginActivity : AppCompatActivity() {
     // ── Fluxo para usuário já logado ──────────────────────────────────────────
     private fun verificarEIniciarRapido(dns: String, user: String, pass: String) {
         lifecycleScope.launch(Dispatchers.IO) {
+            // ✅ NOVO: confere a validade da conta no servidor ANTES de
+            // decidir a próxima tela. Timeout curto (6s) e falha "aberta":
+            // se não conseguir checar (sem internet, servidor lento), segue
+            // o fluxo normal com o que já está em cache — só bloqueia
+            // quando o servidor CONFIRMA que expirou de verdade.
+            val statusConta = verificarSeContaExpirada(user, pass)
+            if (statusConta?.first == true) {
+                withContext(Dispatchers.Main) { abrirTelaExpirado(statusConta.second) }
+                return@launch
+            }
+
             val db = AppDatabase.getDatabase(applicationContext)
             val temConteudo = db.streamDao().getVodCount() > 0
 
@@ -526,6 +539,141 @@ class LoginActivity : AppCompatActivity() {
                 }
             }
         }
+    }
+
+    // ✅ NOVO: chama o mesmo player_api.php de login (via XtreamApi, igual
+    // ao carregarInfoPlano() do Settings) só pra checar status/validade —
+    // não navega em caso de sucesso, só devolve o resultado.
+    // Retorna null se não deu pra checar (sem internet, timeout, erro) —
+    // nesse caso o chamador segue o fluxo normal, sem bloquear ninguém por
+    // uma falha de rede.
+    // Retorna Pair(expirado, éTeste) quando a checagem funciona:
+    //   - expirado: true se status veio "Expired"/"Disabled" OU a data de
+    //     validade (PlanoUtils.classificarPlano) já passou.
+    //   - éTeste: vem direto do campo is_trial que o próprio provedor
+    //     Xtream devolve — usado só pra escolher qual das duas mensagens
+    //     mostrar na tela de bloqueio.
+    private suspend fun verificarSeContaExpirada(user: String, pass: String): Pair<Boolean, Boolean>? {
+        return withTimeoutOrNull(6_000L) {
+            try {
+                val response = XtreamApi.service.login(user, pass).execute()
+                val userInfo = response.body()?.user_info ?: return@withTimeoutOrNull null
+
+                val info = PlanoUtils.classificarPlano(userInfo.exp_date)
+                val statusExpirado = userInfo.status?.equals("Expired", ignoreCase = true) == true ||
+                        userInfo.status?.equals("Disabled", ignoreCase = true) == true
+                val ehTeste = userInfo.is_trial == "1" ||
+                        userInfo.is_trial?.equals("true", ignoreCase = true) == true
+
+                Pair(info.isExpirado || statusExpirado, ehTeste)
+            } catch (e: Exception) {
+                null
+            }
+        }
+    }
+
+    // ============================================================================
+    // ✅ NOVO: tela de bloqueio — assinatura ou teste expirado
+    // ============================================================================
+    // Cobre a tela inteira (via addContentView, igual ao overlay do teste
+    // automático) e NÃO tem botão de fechar nem de voltar — só o botão do
+    // WhatsApp. bloqueadoPorExpiracao trava o botão físico/gesto de voltar
+    // do Android enquanto essa tela estiver em cena (ver onBackPressed()).
+    private var bloqueadoPorExpiracao = false
+
+    private val WHATSAPP_SUPORTE_NUMERO = "5531998491711"
+
+    private fun abrirTelaExpirado(ehTeste: Boolean) {
+        if (bloqueadoPorExpiracao) return // já está bloqueado, não duplica a tela
+        bloqueadoPorExpiracao = true
+        esconderOverlayTesteAutomatico()
+
+        val titulo = if (ehTeste) "Teste expirado" else "Assinatura expirada"
+        val mensagem = if (ehTeste)
+            "Seu teste expirou. Entre em contato com o suporte para assinar o VLTV Play."
+        else
+            "Sua assinatura expirou. Renove agora mesmo para continuar assistindo."
+
+        val icone = TextView(this).apply {
+            text = "⛔"
+            textSize = 44f
+            gravity = Gravity.CENTER
+        }
+        val tvTitulo = TextView(this).apply {
+            text = titulo
+            textSize = 19f
+            setTextColor(Color.WHITE)
+            gravity = Gravity.CENTER
+            setPadding(0, 16.dpToPx, 0, 8.dpToPx)
+        }
+        val tvMensagem = TextView(this).apply {
+            text = mensagem
+            textSize = 14f
+            setTextColor(Color.parseColor("#CCCCCC"))
+            gravity = Gravity.CENTER
+            setPadding(36.dpToPx, 0, 36.dpToPx, 28.dpToPx)
+        }
+        val btnWhatsapp = TextView(this).apply {
+            text = "Falar com o Suporte"
+            textSize = 15f
+            setTextColor(Color.WHITE)
+            gravity = Gravity.CENTER
+            setPadding(36.dpToPx, 14.dpToPx, 36.dpToPx, 14.dpToPx)
+            background = GradientDrawable().apply {
+                setColor(Color.parseColor("#25D366"))
+                cornerRadius = 10.dpToPx.toFloat()
+            }
+            isClickable = true; isFocusable = true
+            setOnClickListener { abrirWhatsAppSuporteExpirado(ehTeste) }
+        }
+
+        val conteudo = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
+            addView(icone, LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+            addView(tvTitulo, LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+            addView(tvMensagem, LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+            addView(btnWhatsapp, LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+        }
+
+        val overlay = FrameLayout(this).apply {
+            layoutParams = ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+            setBackgroundColor(Color.parseColor("#080810"))
+            addView(conteudo, FrameLayout.LayoutParams(FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.CENTER))
+        }
+
+        addContentView(overlay, ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+    }
+
+    private fun abrirWhatsAppSuporteExpirado(ehTeste: Boolean) {
+        val mensagem = if (ehTeste)
+            "Olá! Meu teste do VLTV Play expirou e gostaria de assinar."
+        else
+            "Olá! Minha assinatura do VLTV Play expirou e gostaria de renovar."
+
+        val uri = Uri.parse(
+            "https://api.whatsapp.com/send?phone=$WHATSAPP_SUPORTE_NUMERO&text=${Uri.encode(mensagem)}"
+        )
+        try {
+            val intent = Intent(Intent.ACTION_VIEW, uri)
+            intent.setPackage("com.whatsapp")
+            startActivity(intent)
+        } catch (e: Exception) {
+            try {
+                startActivity(Intent(Intent.ACTION_VIEW, uri))
+            } catch (e2: Exception) {
+                Toast.makeText(this, "Não foi possível abrir o WhatsApp", Toast.LENGTH_SHORT).show()
+            }
+        }
+    }
+
+    @Suppress("DEPRECATION", "MissingSuperCall")
+    override fun onBackPressed() {
+        // ✅ Trava o botão/gesto de voltar do Android enquanto a tela de
+        // "expirado" estiver em cena — sem isso dava pra sair dela e voltar
+        // pro resto do app normalmente.
+        if (bloqueadoPorExpiracao) return
+        super.onBackPressed()
     }
 
     // ── Fluxo de login novo ───────────────────────────────────────────────────
