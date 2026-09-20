@@ -268,6 +268,17 @@ class SettingsActivity : AppCompatActivity() {
 
         cardTrocarLogin?.setOnClickListener { mostrarDialogTrocarCredenciais() }
 
+        // ✅ NOVO: card "Meu Acesso" — mostra usuário, senha e vencimento do
+        // login atual (seja um login manual ou um teste gerado automaticamente
+        // na 1ª abertura do app). Injetado logo ACIMA de "Trocar Credenciais",
+        // na mesma seção CREDENCIAIS, sem precisar mexer no XML.
+        cardTrocarLogin?.let { trocar ->
+            (trocar.parent as? ViewGroup)?.let { parent ->
+                val indexTrocar = parent.indexOfChild(trocar)
+                parent.addView(criarCardMeuAcesso(), indexTrocar)
+            }
+        }
+
         cardLogout?.setOnClickListener {
             mostrarDialogConfirmacao(
                 titulo      = "Sair da Conta",
@@ -341,6 +352,214 @@ class SettingsActivity : AppCompatActivity() {
                 parent.addView(criarCardPinPerfis(), indexLogout)
             }
         }
+    }
+
+    // ============================================================================
+    // ✅ NOVO: "Meu Acesso" — usuário, senha e vencimento do login atual
+    // ============================================================================
+    // Serve tanto pra quem logou manualmente quanto pra quem entrou pelo
+    // teste automático (gerado sozinho na 1ª abertura, sem tela de login) —
+    // nos dois casos o usuário/senha ficam salvos nas mesmas chaves de
+    // "vltv_prefs", então a lógica é idêntica.
+
+    private fun criarCardMeuAcesso(): LinearLayout {
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(16.dp, 14.dp, 16.dp, 14.dp)
+            isClickable = true; isFocusable = true
+            background = GradientDrawable().apply {
+                setColor(Color.parseColor("#1A1A1A"))
+                cornerRadius = 10.dp.toFloat()
+                setStroke(1.dp, Color.parseColor("#2A2A2A"))
+            }
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply {
+                bottomMargin = 10.dp
+                marginStart = 16.dp
+                marginEnd = 16.dp
+            }
+
+            addView(criarIconeCircular("🔑", "#2A2A2A", 36))
+            addView(LinearLayout(context).apply {
+                orientation = LinearLayout.VERTICAL
+                layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
+                    marginStart = 12.dp
+                }
+                addView(TextView(context).apply {
+                    text = "Meu Acesso"
+                    textSize = 14f; typeface = Typeface.DEFAULT_BOLD
+                    setTextColor(Color.WHITE)
+                })
+                addView(TextView(context).apply {
+                    text = "Ver usuário, senha e vencimento"
+                    textSize = 11f
+                    setTextColor(Color.parseColor("#888888"))
+                })
+            })
+            addView(TextView(context).apply {
+                text = "›"; textSize = 20f; setTextColor(Color.parseColor("#555555"))
+            })
+            setOnClickListener { mostrarDialogMeuAcesso() }
+        }
+    }
+
+    // ✅ Copia texto pra área de transferência (usado nos botões de copiar
+    // usuário/senha do dialog "Meu Acesso").
+    private fun copiarParaClipboard(label: String, valor: String) {
+        val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+        clipboard.setPrimaryClip(android.content.ClipData.newPlainText(label, valor))
+        mostrarToastPremium("$label copiado ✓")
+    }
+
+    // ✅ Uma linha "rótulo + valor (mascarável) + botão copiar" — reaproveitada
+    // pra usuário e senha dentro do dialog "Meu Acesso". A senha começa
+    // oculta (••••••••) e pode ser revelada tocando no próprio valor.
+    private fun criarLinhaCredencial(
+        rotulo: String,
+        valor: String,
+        mascaravel: Boolean
+    ): LinearLayout {
+        var revelado = !mascaravel
+
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { bottomMargin = 14.dp }
+
+            addView(TextView(context).apply {
+                text = rotulo
+                textSize = 11f
+                setTextColor(Color.parseColor("#888888"))
+                layoutParams = LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+                ).apply { bottomMargin = 4.dp }
+            })
+
+            val linhaValor = LinearLayout(context).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(14.dp, 12.dp, 10.dp, 12.dp)
+                background = GradientDrawable().apply {
+                    setColor(Color.parseColor("#1E1E1E"))
+                    cornerRadius = 8.dp.toFloat()
+                    setStroke(1.dp, Color.parseColor("#333333"))
+                }
+            }
+
+            val tvValor = TextView(context).apply {
+                text = if (revelado) valor else "•".repeat(valor.length.coerceIn(6, 14))
+                textSize = 14f
+                setTextColor(Color.WHITE)
+                typeface = Typeface.MONOSPACE
+                layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+            }
+
+            if (mascaravel) {
+                tvValor.isClickable = true
+                tvValor.isFocusable = true
+                tvValor.setOnClickListener {
+                    revelado = !revelado
+                    tvValor.text = if (revelado) valor else "•".repeat(valor.length.coerceIn(6, 14))
+                }
+            }
+
+            linhaValor.addView(tvValor)
+            linhaValor.addView(TextView(context).apply {
+                text = "⧉"
+                textSize = 16f
+                setTextColor(Color.parseColor("#AAAAAA"))
+                setPadding(10.dp, 0, 0, 0)
+                isClickable = true; isFocusable = true
+                setOnClickListener { copiarParaClipboard(rotulo, valor) }
+            })
+
+            addView(linhaValor)
+        }
+    }
+
+    private fun mostrarDialogMeuAcesso() {
+        val prefs    = getSharedPreferences("vltv_prefs", Context.MODE_PRIVATE)
+        val username = prefs.getString("username", "") ?: ""
+        val password = prefs.getString("password", "") ?: ""
+
+        if (username.isBlank() || password.isBlank()) {
+            mostrarDialogInfo(
+                titulo   = "Sem acesso salvo",
+                mensagem = "Não encontramos usuário e senha salvos neste aparelho."
+            )
+            return
+        }
+
+        val dialog = android.app.Dialog(this)
+        dialog.requestWindowFeature(android.view.Window.FEATURE_NO_TITLE)
+
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(Color.parseColor("#141414"))
+            setPadding(24.dp, 24.dp, 24.dp, 20.dp)
+        }
+
+        root.addView(TextView(this).apply {
+            text = "🔑 Meu Acesso"
+            textSize = 17f; typeface = Typeface.DEFAULT_BOLD; setTextColor(Color.WHITE)
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { bottomMargin = 6.dp }
+        })
+        root.addView(TextView(this).apply {
+            text = "Use estes dados para acessar em outro aparelho ou renovar seu plano."
+            textSize = 12f; setTextColor(Color.parseColor("#888888")); setLineSpacing(0f, 1.3f)
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { bottomMargin = 18.dp }
+        })
+
+        root.addView(criarLinhaCredencial("Usuário", username, mascaravel = false))
+        root.addView(criarLinhaCredencial("Senha", password, mascaravel = true))
+
+        // ✅ Vencimento reaproveita o mesmo texto já calculado por
+        // carregarInfoPlano()/aplicarInfoPlano() para o card de Assinatura —
+        // não faz uma segunda chamada de rede, só lê o que já está na tela.
+        val vencimentoTexto = tvValidadePlano.text?.toString().orEmpty()
+        if (vencimentoTexto.isNotBlank() && vencimentoTexto != "Carregando..." && vencimentoTexto != "Sincronizando com o servidor...") {
+            root.addView(TextView(this).apply {
+                text = "Vencimento: $vencimentoTexto"
+                textSize = 12f
+                setTextColor(Color.parseColor("#AAAAAA"))
+                layoutParams = LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+                ).apply { topMargin = 2.dp; bottomMargin = 16.dp }
+            })
+        }
+
+        root.addView(TextView(this).apply {
+            text = "Fechar"
+            textSize = 14f; typeface = Typeface.DEFAULT_BOLD; setTextColor(Color.BLACK)
+            gravity = Gravity.CENTER
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, 48.dp
+            ).apply { topMargin = 4.dp }
+            background = GradientDrawable().apply { setColor(Color.WHITE); cornerRadius = 8.dp.toFloat() }
+            isClickable = true; isFocusable = true
+            setOnClickListener { dialog.dismiss() }
+        })
+
+        dialog.setContentView(root)
+        dialog.window?.apply {
+            setBackgroundDrawable(GradientDrawable().apply {
+                setColor(Color.parseColor("#141414"))
+                cornerRadius = 16.dp.toFloat()
+            })
+            val p = attributes
+            p.width = (resources.displayMetrics.widthPixels * 0.88).toInt()
+            attributes = p
+        }
+        dialog.show()
     }
 
     // ============================================================================
