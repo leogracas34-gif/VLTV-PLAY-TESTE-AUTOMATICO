@@ -401,11 +401,28 @@ class LoginActivity : AppCompatActivity() {
             }
             val (user, pass) = credenciais
 
+            // ✅ CORREÇÃO: antes testava os SERVERS um de cada vez
+            // (sequencial) — com 15 servidores e timeout de 10s cada, se os
+            // primeiros não respondessem rápido, podia passar de 1 minuto
+            // fácil. Agora usa o MESMO padrão do login manual
+            // (iniciarLoginTurbo): todos em paralelo, com um teto de 18s
+            // pra fase rápida antes de cair no fallback mais tolerante.
             var dnsVencedor: String? = null
-            for (servidor in SERVERS) {
-                dnsVencedor = testarServidor(servidor, user, pass, clientRapido)
-                if (dnsVencedor != null) break
+            try {
+                val canal = Channel<String>(Channel.UNLIMITED)
+                val jobs = SERVERS.map { url ->
+                    launch(Dispatchers.IO) {
+                        val r = testarServidor(url, user, pass, clientRapido)
+                        if (r != null) canal.trySend(r)
+                    }
+                }
+                dnsVencedor = withTimeoutOrNull(18_000L) { canal.receive() }
+                jobs.forEach { it.cancel() }
+                canal.close()
+            } catch (e: Exception) {
+                e.printStackTrace()
             }
+
             if (dnsVencedor == null) {
                 for (servidor in SERVERS) {
                     dnsVencedor = testarServidor(servidor, user, pass, clientLento)
