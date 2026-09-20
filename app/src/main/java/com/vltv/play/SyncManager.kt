@@ -17,6 +17,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
+import org.json.JSONObject
 import java.net.URL
 
 /**
@@ -47,6 +48,19 @@ import java.net.URL
  * automaticamente pro caminho de sempre: baixa do Xtream e, ao final,
  * ainda manda esse catálogo pro backend via enviarCatalogo() — pra que
  * o PRÓXIMO cliente desse mesmo painel já encontre tudo pronto.
+ *
+ * ✅ CORRIGIDO (Top10/Top10 Brasil/Novidade saindo zerados quando o
+ * catálogo vem pronto do backend, numa instalação nova): sincronizarVod/
+ * sincronizarSeries montavam esses campos calculados SEMPRE a partir do
+ * que já existia localmente (vodsExistentes/seriesExistentes) — numa
+ * instalação nova esse mapa está vazio, então tudo saía 0/null mesmo
+ * quando o JSON vindo do backend (GET /catalog) já trazia os valores
+ * prontos. Só reapareciam depois, quando buscarHome()+HomeBackendSync
+ * terminassem de rodar por cima — daí o atraso perceptível na 1ª
+ * abertura. Agora esses campos são lidos do PRÓPRIO JSON quando a chave
+ * existe nele (é o caso do catálogo do backend); só caem pro que já
+ * existia localmente quando a chave não existe no JSON (é o caso do
+ * retorno cru do Xtream, que nunca tem esses campos calculados).
  *
  * Depois disso, como já acontecia: se o backend responder com
  * Top10/Novidades/selos prontos (HomeApiClient.buscarHome), o app aplica
@@ -415,11 +429,38 @@ object SyncManager {
         return JSONArray(URL(url).readText())
     }
 
+    // ✅ NOVO — helpers de leitura "JSON tem prioridade, existente é
+    // fallback": usados pelos campos calculados pelo TMDB (logo, top10,
+    // top10 Brasil, novidade, badges de série). Quando o array vem do
+    // GET /catalog do backend, o JSON já tem essas chaves com valor
+    // pronto — usamos direto. Quando o array vem cru do Xtream
+    // (get_vod_streams/get_series), essas chaves NUNCA existem — nesse
+    // caso preservamos o que já estava salvo localmente (senão toda
+    // sincronização periódica apagaria os selos calculados até o
+    // TmdbSyncHelper/backend recalcular de novo).
+    private fun campoTextoOuExistente(obj: JSONObject, chave: String, existente: String?): String? =
+        if (obj.has(chave)) obj.optString(chave).takeIf { it.isNotEmpty() } else existente
+
+    private fun campoIntOuExistente(obj: JSONObject, chave: String, existente: Int): Int =
+        if (obj.has(chave)) obj.optInt(chave, existente) else existente
+
+    private fun campoLongOuExistente(obj: JSONObject, chave: String, existente: Long): Long =
+        if (obj.has(chave)) obj.optLong(chave, existente) else existente
+
+    private fun campoIdOuExistente(obj: JSONObject, chave: String, existente: Int?): Int? = when {
+        !obj.has(chave) -> existente
+        obj.isNull(chave) -> null
+        else -> obj.optInt(chave)
+    }
+
     // ── VOD ────────────────────────────────────────────────────────────────
     // Recebe o array já pronto (vindo do backend OU recém-baixado do
-    // Xtream via buscarArrayXtream) — o formato dos campos é o mesmo nos
-    // dois casos, então o processamento é idêntico independente da
-    // origem.
+    // Xtream via buscarArrayXtream) — o formato dos campos CRUS (name,
+    // stream_icon, category_id...) é o mesmo nos dois casos, então o
+    // processamento é idêntico independente da origem. Os campos
+    // CALCULADOS (logo_url, top10, top10_brasil, novidade) é que mudam
+    // de fonte dependendo se o JSON já os traz ou não — ver os helpers
+    // campoXOuExistente acima.
     private suspend fun sincronizarVod(
         db: AppDatabase, vodArray: JSONArray,
         palavrasProibidas: List<String>, vodsExistentes: Map<Int, VodEntity>
@@ -444,20 +485,20 @@ object SyncManager {
                     rating = obj.optString("rating"),
                     category_id = obj.optString("category_id"),
                     added = obj.optLong("added"),
-                    // ↓ preservados do que já existia (senão o TMDB
-                    // precisaria recalcular tudo de novo a cada sync)
-                    logo_url = existente?.logo_url,
-                    tmdb_rank = existente?.tmdb_rank ?: 0,
-                    tmdb_release_date = existente?.tmdb_release_date,
-                    is_top10 = existente?.is_top10 ?: 0,
-                    is_novidade = existente?.is_novidade ?: 0,
-                    tmdb_id = existente?.tmdb_id,
-                    backdrop_path = existente?.backdrop_path,
-                    // ✅ NOVO: preserva o Top 10 Brasil do mesmo jeito —
-                    // senão toda sincronização (a cada 10 min) apagava
-                    // esse selo até o backend recalcular de novo.
-                    is_top10_brasil = existente?.is_top10_brasil ?: 0,
-                    tmdb_rank_brasil = existente?.tmdb_rank_brasil ?: 0
+                    // ✅ CORRIGIDO: antes vinha só de `existente` (sempre 0/
+                    // null numa instalação nova, mesmo o JSON já trazendo
+                    // pronto do backend). Agora usa o valor do próprio JSON
+                    // quando a chave existe nele.
+                    logo_url = campoTextoOuExistente(obj, "logo_url", existente?.logo_url),
+                    tmdb_rank = campoIntOuExistente(obj, "tmdb_rank", existente?.tmdb_rank ?: 0),
+                    tmdb_release_date = campoTextoOuExistente(obj, "tmdb_release_date", existente?.tmdb_release_date),
+                    is_top10 = campoIntOuExistente(obj, "is_top10", existente?.is_top10 ?: 0),
+                    is_novidade = campoIntOuExistente(obj, "is_novidade", existente?.is_novidade ?: 0),
+                    tmdb_id = campoIdOuExistente(obj, "tmdb_id", existente?.tmdb_id),
+                    backdrop_path = campoTextoOuExistente(obj, "backdrop_path", existente?.backdrop_path),
+                    // ✅ Top 10 Brasil — mesma correção acima.
+                    is_top10_brasil = campoIntOuExistente(obj, "is_top10_brasil", existente?.is_top10_brasil ?: 0),
+                    tmdb_rank_brasil = campoIntOuExistente(obj, "tmdb_rank_brasil", existente?.tmdb_rank_brasil ?: 0)
                 )
                 vodBatch.add(entity)
                 todosVods.add(entity)
@@ -476,7 +517,8 @@ object SyncManager {
 
     // ── SÉRIES ─────────────────────────────────────────────────────────────
     // Mesma ideia do sincronizarVod: recebe o array já pronto, seja do
-    // backend ou recém-baixado do Xtream.
+    // backend ou recém-baixado do Xtream, e usa os helpers
+    // campoXOuExistente pros campos calculados.
     private suspend fun sincronizarSeries(
         db: AppDatabase, seriesArray: JSONArray,
         palavrasProibidas: List<String>, seriesExistentes: Map<Int, SeriesEntity>
@@ -497,23 +539,26 @@ object SyncManager {
                     rating = obj.optString("rating"),
                     category_id = obj.optString("category_id"),
                     last_modified = obj.optLong("last_modified"),
-                    // ↓ preservados do que já existia
-                    logo_url = existente?.logo_url,
-                    tmdb_rank = existente?.tmdb_rank ?: 0,
-                    tmdb_release_date = existente?.tmdb_release_date,
-                    is_top10 = existente?.is_top10 ?: 0,
-                    is_novidade = existente?.is_novidade ?: 0,
-                    tmdb_id = existente?.tmdb_id,
-                    backdrop_path = existente?.backdrop_path,
-                    tmdb_ultima_temporada = existente?.tmdb_ultima_temporada ?: 0,
-                    tmdb_ultimo_episodio = existente?.tmdb_ultimo_episodio ?: 0,
-                    is_nova_temporada = existente?.is_nova_temporada ?: 0,
-                    is_novo_episodio = existente?.is_novo_episodio ?: 0,
-                    tmdb_flag_marcado_em = existente?.tmdb_flag_marcado_em ?: 0,
-                    tmdb_proxima_temporada_data = existente?.tmdb_proxima_temporada_data,
-                    // ✅ NOVO: mesma preservação do Top 10 Brasil feita em sincronizarVod.
-                    is_top10_brasil = existente?.is_top10_brasil ?: 0,
-                    tmdb_rank_brasil = existente?.tmdb_rank_brasil ?: 0
+                    // ✅ CORRIGIDO: mesma correção do sincronizarVod — usa
+                    // o valor do JSON quando presente, senão preserva o
+                    // que já existia localmente.
+                    logo_url = campoTextoOuExistente(obj, "logo_url", existente?.logo_url),
+                    tmdb_rank = campoIntOuExistente(obj, "tmdb_rank", existente?.tmdb_rank ?: 0),
+                    tmdb_release_date = campoTextoOuExistente(obj, "tmdb_release_date", existente?.tmdb_release_date),
+                    is_top10 = campoIntOuExistente(obj, "is_top10", existente?.is_top10 ?: 0),
+                    is_novidade = campoIntOuExistente(obj, "is_novidade", existente?.is_novidade ?: 0),
+                    tmdb_id = campoIdOuExistente(obj, "tmdb_id", existente?.tmdb_id),
+                    backdrop_path = campoTextoOuExistente(obj, "backdrop_path", existente?.backdrop_path),
+                    tmdb_ultima_temporada = campoIntOuExistente(obj, "tmdb_ultima_temporada", existente?.tmdb_ultima_temporada ?: 0),
+                    tmdb_ultimo_episodio = campoIntOuExistente(obj, "tmdb_ultimo_episodio", existente?.tmdb_ultimo_episodio ?: 0),
+                    is_nova_temporada = campoIntOuExistente(obj, "is_nova_temporada", existente?.is_nova_temporada ?: 0),
+                    is_novo_episodio = campoIntOuExistente(obj, "is_novo_episodio", existente?.is_novo_episodio ?: 0),
+                    tmdb_flag_marcado_em = campoLongOuExistente(obj, "tmdb_flag_marcado_em", existente?.tmdb_flag_marcado_em ?: 0),
+                    tmdb_proxima_temporada_data = campoTextoOuExistente(obj, "tmdb_proxima_temporada_data", existente?.tmdb_proxima_temporada_data),
+                    tmdb_proximo_episodio_data = campoTextoOuExistente(obj, "tmdb_proximo_episodio_data", existente?.tmdb_proximo_episodio_data),
+                    // ✅ Top 10 Brasil — mesma correção acima.
+                    is_top10_brasil = campoIntOuExistente(obj, "is_top10_brasil", existente?.is_top10_brasil ?: 0),
+                    tmdb_rank_brasil = campoIntOuExistente(obj, "tmdb_rank_brasil", existente?.tmdb_rank_brasil ?: 0)
                 )
                 seriesBatch.add(entity)
                 todasSeries.add(entity)
