@@ -172,10 +172,21 @@ class LoginActivity : AppCompatActivity() {
         }
 
         val texto = TextView(this).apply {
-            text = "Preparando seu teste..."
+            text = "Gerando seu teste automático..."
             textSize = 14f
             setTextColor(Color.parseColor("#CCCCCC"))
             gravity = Gravity.CENTER
+            // ✅ CORREÇÃO DO BUG "Prep": sem isto, o LinearLayout vertical
+            // pai gera um LayoutParams padrão com largura MATCH_PARENT pra
+            // esta TextView — mas como o próprio pai (conteudo) também está
+            // em WRAP_CONTENT, isso criava um conflito de medida que
+            // colapsava a largura do texto quase a zero, cortando a
+            // mensagem logo depois de "Prep". WRAP_CONTENT explícito aqui
+            // resolve, deixando o texto do tamanho real dele.
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            )
         }
 
         val conteudo = LinearLayout(this).apply {
