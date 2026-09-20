@@ -258,6 +258,20 @@ class LoginActivity : AppCompatActivity() {
     // login/perfil e deixa o app cair normalmente na tela de login. Depois
     // disso o marcador é gravado, e essa limpeza não roda de novo até a
     // próxima desinstalação/reinstalação.
+    //
+    // ✅ CORREÇÃO (bug "reinstalei e não gerou teste automático"): faltava
+    // remover "logout_requested" aqui também. Esse flag mora no MESMO
+    // arquivo "vltv_prefs" — e esse arquivo inteiro é alvo do Auto Backup
+    // (só "vltv_device_marker" é excluído). Então, se em algum momento
+    // antes de desinstalar você tinha clicado em "Sair" (deixando
+    // logout_requested = true salvo), o Android restaurava esse valor
+    // junto no reinstall. O restante da função já limpava username/
+    // password/dns corretamente (savedUser saía null), mas como
+    // logout_requested continuava true, o onCreate caía direto no ramo
+    // "saiu de propósito" (setupUI() manual) em vez de tentar o teste
+    // automático — mesmo sendo, de fato, uma instalação nova. Removendo
+    // essa chave junto com as demais, uma reinstalação de verdade sempre
+    // passa a cair no ramo do teste automático novamente.
     private fun limparLoginRestauradoSeInstalacaoNova() {
         val marcador = getSharedPreferences("vltv_device_marker", Context.MODE_PRIVATE)
         val jaRodouNesteAparelho = marcador.getBoolean("instalado", false)
@@ -269,6 +283,7 @@ class LoginActivity : AppCompatActivity() {
                 .remove("dns")
                 .remove("last_profile_name")
                 .remove("last_profile_icon")
+                .remove("logout_requested")
                 .apply()
 
             marcador.edit().putBoolean("instalado", true).apply()
