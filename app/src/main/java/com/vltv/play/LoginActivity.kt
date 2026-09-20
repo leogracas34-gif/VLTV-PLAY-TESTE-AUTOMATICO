@@ -8,6 +8,7 @@ import android.content.res.Configuration
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.provider.Settings
 import android.text.InputType
 import android.view.MotionEvent
 import android.view.View
@@ -24,9 +25,12 @@ import com.vltv.play.data.VodEntity
 import com.vltv.play.databinding.ActivityLoginBinding
 import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.Channel
+import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
+import org.json.JSONObject
 import java.util.concurrent.TimeUnit
 
 class LoginActivity : AppCompatActivity() {
@@ -80,6 +84,24 @@ class LoginActivity : AppCompatActivity() {
     // false (senha oculta) a cada abertura da tela de login.
     private var senhaVisivel = false
 
+    // ============================================================================
+    // ✅ NOVO: TESTE AUTOMÁTICO — 1ª abertura do app, sem tela de login
+    // ============================================================================
+    // Cada build do app usa UMA lista fixa. Pro app principal (com.vltv.play):
+    // "lista1". Pro segundo app (VLTV-PLAY-NOVA-HOME): trocar esta única
+    // linha para "lista2" — o resto da lógica é idêntico nos dois apps.
+    private val LISTA_TESTE = "lista1"
+
+    // Mesmo domínio do site (vltvplay.tech) — a chave do provedor IPTV fica
+    // só no servidor; o app nunca fala direto com o painel.
+    private val AUTO_TRIAL_URL = "https://vltvplay.tech/api/app-auto-trial"
+
+    private val clientAutoTrial = OkHttpClient.Builder()
+        .connectTimeout(12, TimeUnit.SECONDS)
+        .readTimeout(20, TimeUnit.SECONDS)
+        .retryOnConnectionFailure(false)
+        .build()
+
     override fun onCreate(savedInstanceState: Bundle?) {
         // ✅ REMOVIDO: installSplashScreen() saiu daqui. A LoginActivity não
         // é mais a porta de entrada do app — quem cobre esse papel agora é
@@ -111,7 +133,13 @@ class LoginActivity : AppCompatActivity() {
             binding.root.visibility = View.INVISIBLE
             verificarEIniciarRapido(savedDns, savedUser, savedPass)
         } else {
-            setupUI()
+            // ✅ ANTES: caía direto em setupUI() (tela de login manual).
+            // AGORA: tenta primeiro o teste automático em segundo plano;
+            // só mostra a tela de login manual se o teste automático falhar
+            // por qualquer motivo (sem internet, servidor fora do ar,
+            // credenciais do teste inválidas etc.) — ver iniciarTesteAutomatico().
+            binding.root.visibility = View.INVISIBLE
+            iniciarTesteAutomatico()
         }
     }
 
@@ -164,6 +192,7 @@ class LoginActivity : AppCompatActivity() {
     }
 
     private fun setupUI() {
+        binding.root.visibility = View.VISIBLE
         binding.btnLogin.isFocusableInTouchMode = false
         binding.btnLogin.isFocusable = false
 
@@ -284,6 +313,110 @@ class LoginActivity : AppCompatActivity() {
         binding.btnLogin.isEnabled = true
         binding.etUsername.isEnabled = true
         binding.etPassword.isEnabled = true
+    }
+
+    // ============================================================================
+    // ✅ NOVO: fluxo de teste automático (1ª abertura, sem login salvo)
+    // ============================================================================
+    // 1) Pega o ANDROID_ID do aparelho.
+    // 2) Chama o backend (mesma lógica de geração de teste do site) pedindo
+    //    um teste pra LISTA_TESTE, identificado por esse ANDROID_ID — o
+    //    backend garante que o MESMO aparelho nunca recebe dois testes
+    //    diferentes (reinstalar não gera teste novo).
+    // 3) Com usuário/senha em mãos, testa os mesmos SERVERS já usados no
+    //    login manual pra descobrir o DNS que responde (a Lista 1 nem
+    //    devolve DNS — o app sempre descobriu por conta própria).
+    // 4) Se tudo der certo, salva como se fosse um login manual normal e
+    //    segue pra tela de Perfis.
+    // 5) Qualquer falha em qualquer etapa (sem internet, backend fora do
+    //    ar, credenciais inválidas) cai silenciosamente na tela de login
+    //    manual (setupUI()) — nunca trava o app.
+    private fun iniciarTesteAutomatico() {
+        lifecycleScope.launch(Dispatchers.IO) {
+            val androidId = obterAndroidIdParaTeste()
+
+            val credenciais = solicitarTesteAutomatico(androidId)
+            if (credenciais == null) {
+                withContext(Dispatchers.Main) { setupUI() }
+                return@launch
+            }
+            val (user, pass) = credenciais
+
+            var dnsVencedor: String? = null
+            for (servidor in SERVERS) {
+                dnsVencedor = testarServidor(servidor, user, pass, clientRapido)
+                if (dnsVencedor != null) break
+            }
+            if (dnsVencedor == null) {
+                for (servidor in SERVERS) {
+                    dnsVencedor = testarServidor(servidor, user, pass, clientLento)
+                    if (dnsVencedor != null) break
+                }
+            }
+
+            if (dnsVencedor == null) {
+                // Teste recebido do servidor não bateu em nenhum DNS (pode
+                // acontecer com um teste antigo/expirado reaproveitado após
+                // logout) — não trava o cliente, só mostra o login manual.
+                withContext(Dispatchers.Main) { setupUI() }
+                return@launch
+            }
+
+            val dnsFinal = normalizarBaseUrl(dnsVencedor)
+            salvarCredenciais(dnsFinal, user, pass)
+
+            ContentRepository.recarregar(applicationContext)
+            launch(Dispatchers.IO) { preCarregarLoteMinimo(dnsFinal, user, pass) }
+
+            withContext(Dispatchers.Main) {
+                val intent = Intent(this@LoginActivity, ProfilesActivity::class.java)
+                intent.flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK
+                startActivity(intent)
+                finish()
+            }
+        }
+    }
+
+    // ANDROID_ID: identificador do aparelho, único por app+dispositivo,
+    // sobrevive a reinstalação do app (só muda com reset de fábrica) — é
+    // exatamente o comportamento necessário pra travar abuso de reinstalar
+    // pra ganhar teste novo.
+    @SuppressWarnings("HardwareIds")
+    private fun obterAndroidIdParaTeste(): String {
+        return try {
+            Settings.Secure.getString(contentResolver, Settings.Secure.ANDROID_ID)
+                ?.takeIf { it.isNotBlank() }
+                ?: "sem_android_id"
+        } catch (e: Exception) {
+            "sem_android_id"
+        }
+    }
+
+    private fun solicitarTesteAutomatico(androidId: String): Pair<String, String>? {
+        return try {
+            val bodyJson = JSONObject().apply {
+                put("listId", LISTA_TESTE)
+                put("deviceId", androidId)
+            }
+            val body = bodyJson.toString().toRequestBody("application/json".toMediaType())
+            val request = Request.Builder()
+                .url(AUTO_TRIAL_URL)
+                .post(body)
+                .build()
+
+            clientAutoTrial.newCall(request).execute().use { response ->
+                val raw = response.body?.string()
+                if (!response.isSuccessful || raw.isNullOrBlank()) return null
+
+                val json = JSONObject(raw)
+                val user = json.optString("username", "")
+                val pass = json.optString("password", "")
+                if (user.isBlank() || pass.isBlank()) null else Pair(user, pass)
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+            null
+        }
     }
 
     // ── Fluxo para usuário já logado ──────────────────────────────────────────
