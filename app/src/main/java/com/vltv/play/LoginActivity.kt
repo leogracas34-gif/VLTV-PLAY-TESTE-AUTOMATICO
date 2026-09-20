@@ -139,9 +139,31 @@ class LoginActivity : AppCompatActivity() {
         val savedPass = prefs.getString("password", null)
         val savedDns  = prefs.getString("dns", null)
 
+        // ✅ NOVO: distingue "nunca teve login" (1ª instalação de verdade,
+        // pode gerar teste automático) de "acabou de sair da conta pelo
+        // botão de Configurações" (logout_requested = true). Sem isso, ao
+        // clicar em "Sair da Conta", o app caía de novo no teste
+        // automático e — pra um aparelho que já tinha teste gerado antes —
+        // voltava a logar sozinho na MESMA conta de teste, em vez de
+        // deixar a pessoa entrar com outro usuário/senha (ou simplesmente
+        // sair). A flag já era gravada pelo SettingsActivity no logout,
+        // só nunca era lida aqui.
+        val logoutSolicitado = prefs.getBoolean("logout_requested", false)
+        if (logoutSolicitado) {
+            prefs.edit().remove("logout_requested").apply()
+        }
+
         if (!savedUser.isNullOrBlank() && !savedPass.isNullOrBlank() && !savedDns.isNullOrBlank()) {
             binding.root.visibility = View.INVISIBLE
+            // ✅ NOVO: mostra o mesmo overlay do teste automático (com
+            // outra mensagem) durante a checagem de validade — antes essa
+            // etapa deixava a tela preta e sem feedback nenhum por até 6s.
+            mostrarOverlayTesteAutomatico("Verificando sua conta...")
             verificarEIniciarRapido(savedDns, savedUser, savedPass)
+        } else if (logoutSolicitado) {
+            // Saiu da conta de propósito — mostra o login manual, sem
+            // gerar teste automático de novo.
+            setupUI()
         } else {
             // ✅ ANTES: caía direto em setupUI() (tela de login manual).
             // AGORA: tenta primeiro o teste automático em segundo plano.
@@ -165,7 +187,7 @@ class LoginActivity : AppCompatActivity() {
 
     private val Int.dpToPx: Int get() = (this * resources.displayMetrics.density).toInt()
 
-    private fun mostrarOverlayTesteAutomatico() {
+    private fun mostrarOverlayTesteAutomatico(mensagem: String = "Gerando seu teste automático...") {
         if (overlayTesteAutomatico != null) return
 
         val progress = ProgressBar(this).apply {
@@ -174,7 +196,7 @@ class LoginActivity : AppCompatActivity() {
         }
 
         val texto = TextView(this).apply {
-            text = "Gerando seu teste automático..."
+            text = mensagem
             textSize = 14f
             setTextColor(Color.parseColor("#CCCCCC"))
             gravity = Gravity.CENTER
@@ -526,6 +548,7 @@ class LoginActivity : AppCompatActivity() {
             val temConteudo = db.streamDao().getVodCount() > 0
 
             withContext(Dispatchers.Main) {
+                esconderOverlayTesteAutomatico()
                 if (temConteudo) {
                     decidirProximaTela()
                     launch(Dispatchers.IO) {
