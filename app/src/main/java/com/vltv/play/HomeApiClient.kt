@@ -104,10 +104,20 @@ object HomeApiClient {
      * qualquer erro é só logado (printStackTrace), pra nunca atrasar ou
      * travar a sincronização normal do app se o backend estiver
      * indisponível ou ainda não tiver sido configurado.
+     *
+     * ✅ CORRIGIDO: agora devolve Boolean — true SÓ se o backend recebeu o
+     * catálogo (HTTP 2xx, ou o corpo foi inteiro enviado e a resposta só
+     * demorou mais que o timeout porque o backend ainda estava
+     * processando o TMDB). Antes devolvia Unit, então o SyncManager
+     * marcava "já enviei esse painel" mesmo quando o upload falhava
+     * (timeout, conexão caindo, backend fora do ar) — e nunca mais
+     * tentava de novo, deixando o backend sem catálogo desse painel e
+     * toda instalação nova caindo no download lento direto do Xtream.
      */
-    suspend fun enviarCatalogo(dns: String, vods: List<VodEntity>, series: List<SeriesEntity>) {
+    suspend fun enviarCatalogo(dns: String, vods: List<VodEntity>, series: List<SeriesEntity>): Boolean =
         withContext(Dispatchers.IO) {
             var conn: HttpURLConnection? = null
+            var corpoEnviado = false
             try {
                 val vodArray = JSONArray()
                 for (v in vods) {
@@ -147,15 +157,25 @@ object HomeApiClient {
                     setRequestProperty("x-app-key", APP_SHARED_KEY)
                 }
                 conn.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
-                // força a requisição a completar e lê a resposta (mesmo sem usá-la)
+                corpoEnviado = true
+                // força a requisição a completar e lê a resposta (mesmo sem usá-la).
+                // inputStream lança IOException em HTTP >= 400, caindo no catch (false).
+                val codigo = conn.responseCode
                 conn.inputStream.bufferedReader().use { it.readText() }
+                codigo in 200..299
+            } catch (e: java.net.SocketTimeoutException) {
+                e.printStackTrace()
+                // Se o corpo já tinha sido enviado por inteiro, o backend TEM o
+                // catálogo e só estava demorando pra responder (processa o TMDB
+                // antes de responder). Não vale reenviar tudo de novo.
+                corpoEnviado
             } catch (e: Exception) {
                 e.printStackTrace()
+                false
             } finally {
                 conn?.disconnect()
             }
         }
-    }
 
     /**
      * Busca o CATÁLOGO INTEIRO (todos os filmes e séries, não só
