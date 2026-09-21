@@ -113,7 +113,18 @@ object PlanoUtils {
             }
 
             val diffMs      = expDate.time - hoje.time
-            val diasRestantes = TimeUnit.MILLISECONDS.toDays(diffMs)
+
+            // ✅ CORREÇÃO (aviso de expirado não aparecia): antes era
+            // TimeUnit.MILLISECONDS.toDays(diffMs), que TRUNCA em direção
+            // ao zero — então uma conta que venceu há, por exemplo, 5
+            // horas dava diasRestantes = 0 (e não -1), e o teste
+            // "diasRestantes < 0" abaixo NUNCA considerava expirada
+            // nenhuma conta vencida há menos de 24h. Como testes
+            // automáticos duram poucas horas, quase todo teste expirado
+            // caía nesse buraco. floorDiv arredonda pra baixo: 5h no
+            // passado vira -1 (expirado), e valores positivos continuam
+            // exatamente iguais aos de antes.
+            val diasRestantes = diffMs.floorDiv(TimeUnit.DAYS.toMillis(1))
             val mesesRestantes = diasRestantes / 30L
 
             val sdfOut = SimpleDateFormat("dd/MM/yyyy", Locale.getDefault())
