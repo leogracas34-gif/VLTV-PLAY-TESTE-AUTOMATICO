@@ -94,6 +94,16 @@ class LoginActivity : AppCompatActivity() {
     // false (senha oculta) a cada abertura da tela de login.
     private var senhaVisivel = false
 
+    // ✅ NOVO: preenchidos por testarServidor() quando algum servidor
+    // responde que a conta EXISTE mas está expirada/desativada. Antes essa
+    // resposta era descartada em silêncio (o servidor só era considerado
+    // "não encontrado"), então quem tentava entrar com uma conta vencida
+    // via "Servidor não encontrado. Verifique login e senha." em vez de
+    // saber que o plano expirou. Volatile porque testarServidor() roda em
+    // várias threads ao mesmo tempo (fase rápida em paralelo).
+    @Volatile private var contaExpiradaDetectada = false
+    @Volatile private var contaExpiradaEhTeste = false
+
     // ============================================================================
     // ✅ NOVO: TESTE AUTOMÁTICO — 1ª abertura do app, sem tela de login
     // ============================================================================
@@ -140,18 +150,24 @@ class LoginActivity : AppCompatActivity() {
         val savedDns  = prefs.getString("dns", null)
 
         // ✅ NOVO: distingue "nunca teve login" (1ª instalação de verdade,
-        // pode gerar teste automático) de "acabou de sair da conta pelo
-        // botão de Configurações" (logout_requested = true). Sem isso, ao
-        // clicar em "Sair da Conta", o app caía de novo no teste
-        // automático e — pra um aparelho que já tinha teste gerado antes —
-        // voltava a logar sozinho na MESMA conta de teste, em vez de
-        // deixar a pessoa entrar com outro usuário/senha (ou simplesmente
-        // sair). A flag já era gravada pelo SettingsActivity no logout,
-        // só nunca era lida aqui.
+        // pode gerar teste automático) de "saiu da conta pelo botão de
+        // Configurações" (logout_requested = true). Sem isso, ao clicar em
+        // "Sair da Conta", o app caía de novo no teste automático e — pra um
+        // aparelho que já tinha teste gerado antes — voltava a logar sozinho
+        // em vez de deixar a pessoa entrar com outro usuário/senha.
+        //
+        // ✅ CORREÇÃO (Sair → gerava teste automático): antes esta flag era
+        // APAGADA aqui mesmo, assim que a tela de login abria pela primeira
+        // vez. Aí, se o app fosse fechado e aberto de novo (ou se esta
+        // Activity fosse recriada por qualquer motivo) sem ter feito login,
+        // a flag já não existia mais: sem login salvo e sem flag, o app
+        // achava que era uma instalação nova e gerava outro teste
+        // automático, mandando direto pra tela de Perfis. Agora a flag só é
+        // apagada quando um login é de fato salvo (ver salvarCredenciais()),
+        // então "saí de propósito" continua valendo até a pessoa entrar de
+        // novo. A limpeza de instalação nova (limparLoginRestauradoSeInstalacaoNova)
+        // continua removendo a flag quando ela veio de backup restaurado.
         val logoutSolicitado = prefs.getBoolean("logout_requested", false)
-        if (logoutSolicitado) {
-            prefs.edit().remove("logout_requested").apply()
-        }
 
         if (!savedUser.isNullOrBlank() && !savedPass.isNullOrBlank() && !savedDns.isNullOrBlank()) {
             binding.root.visibility = View.INVISIBLE
@@ -440,8 +456,13 @@ class LoginActivity : AppCompatActivity() {
     // 5) Qualquer falha em qualquer etapa (sem internet, backend fora do
     //    ar, credenciais inválidas) cai silenciosamente na tela de login
     //    manual (setupUI()) — nunca trava o app.
+    //    ✅ NOVO: se a falha for porque o teste recebido JÁ EXPIROU, cai no
+    //    login manual COM um aviso de que o teste expirou.
     private fun iniciarTesteAutomatico() {
         lifecycleScope.launch(Dispatchers.IO) {
+            contaExpiradaDetectada = false
+            contaExpiradaEhTeste = false
+
             val androidId = obterAndroidIdParaTeste()
 
             val credenciais = solicitarTesteAutomatico(androidId)
@@ -473,7 +494,9 @@ class LoginActivity : AppCompatActivity() {
                 e.printStackTrace()
             }
 
-            if (dnsVencedor == null) {
+            // ✅ Se algum servidor já confirmou que a conta expirou, não
+            // adianta rodar o fallback lento em todos os servidores.
+            if (dnsVencedor == null && !contaExpiradaDetectada) {
                 for (servidor in SERVERS) {
                     dnsVencedor = testarServidor(servidor, user, pass, clientLento)
                     if (dnsVencedor != null) break
@@ -484,7 +507,20 @@ class LoginActivity : AppCompatActivity() {
                 // Teste recebido do servidor não bateu em nenhum DNS (pode
                 // acontecer com um teste antigo/expirado reaproveitado após
                 // logout) — não trava o cliente, só mostra o login manual.
-                withContext(Dispatchers.Main) { esconderOverlayTesteAutomatico(); setupUI() }
+                val testeExpirou = contaExpiradaDetectada
+                withContext(Dispatchers.Main) {
+                    esconderOverlayTesteAutomatico()
+                    setupUI()
+                    // ✅ NOVO: se o motivo foi expiração, avisa em vez de
+                    // simplesmente aparecer o login sem explicação.
+                    if (testeExpirou) {
+                        Toast.makeText(
+                            this@LoginActivity,
+                            "Seu teste expirou. Entre com seu usuário e senha ou fale com o suporte para assinar.",
+                            Toast.LENGTH_LONG
+                        ).show()
+                    }
+                }
                 return@launch
             }
 
@@ -548,6 +584,15 @@ class LoginActivity : AppCompatActivity() {
     // ── Fluxo para usuário já logado ──────────────────────────────────────────
     private fun verificarEIniciarRapido(dns: String, user: String, pass: String) {
         lifecycleScope.launch(Dispatchers.IO) {
+            // ✅ CORREÇÃO: garante que o XtreamApi está apontando pro DNS
+            // salvo ANTES de checar a validade. verificarSeContaExpirada()
+            // usa o XtreamApi.service, que depende da baseUrl já ter sido
+            // carregada — se ela ainda estivesse vazia (cai em
+            // http://localhost/), a checagem falhava em silêncio, o "falha
+            // aberta" deixava o app entrar normalmente e o aviso de
+            // expirado nunca aparecia.
+            XtreamApi.setBaseUrl(dns)
+
             // ✅ NOVO: confere a validade da conta no servidor ANTES de
             // decidir a próxima tela. Timeout curto (6s) e falha "aberta":
             // se não conseguir checar (sem internet, servidor lento), segue
@@ -719,6 +764,9 @@ class LoginActivity : AppCompatActivity() {
         mostrarLoading()
 
         lifecycleScope.launch(Dispatchers.IO) {
+            contaExpiradaDetectada = false
+            contaExpiradaEhTeste = false
+
             var dnsVencedor: String? = null
 
             try {
@@ -741,7 +789,9 @@ class LoginActivity : AppCompatActivity() {
             // ativado) — pra dar uma segunda chance aos mesmos 7 DNS reais
             // antes de desistir, em vez de testar servidores que você não
             // usa mais.
-            if (dnsVencedor == null) {
+            // ✅ Se algum servidor já confirmou que a conta expirou, pula
+            // o fallback — não adianta insistir.
+            if (dnsVencedor == null && !contaExpiradaDetectada) {
                 for (servidor in SERVERS) {
                     val r = testarServidor(servidor, user, pass, clientLento)
                     if (r != null) { dnsVencedor = r; break }
@@ -778,9 +828,21 @@ class LoginActivity : AppCompatActivity() {
                 }
 
             } else {
+                // ✅ NOVO: se o servidor confirmou que a conta existe mas
+                // está expirada, avisa isso em vez do genérico "Servidor
+                // não encontrado" (que fazia parecer login/senha errados).
+                val expirada = contaExpiradaDetectada
+                val ehTeste = contaExpiradaEhTeste
                 withContext(Dispatchers.Main) {
                     esconderLoading()
-                    mostrarErro("Servidor não encontrado. Verifique login e senha.")
+                    if (expirada) {
+                        mostrarErro(
+                            if (ehTeste) "Seu teste expirou. Fale com o suporte para assinar."
+                            else "Sua assinatura expirou. Fale com o suporte para renovar."
+                        )
+                    } else {
+                        mostrarErro("Servidor não encontrado. Verifique login e senha.")
+                    }
                 }
             }
         }
@@ -798,6 +860,26 @@ class LoginActivity : AppCompatActivity() {
             httpClient.newCall(request).execute().use { response ->
                 if (response.isSuccessful) {
                     val body = response.body?.string() ?: ""
+
+                    // ✅ NOVO: registra quando o servidor responde que a
+                    // conta existe (auth diferente de 0) mas está
+                    // Expired/Disabled. A conta continua sendo rejeitada
+                    // abaixo (retorna null), mas quem chamou agora sabe
+                    // que o motivo foi expiração e pode avisar o usuário.
+                    val temUserInfo = body.contains("user_info") && body.contains("server_info")
+                    val authZero = Regex("\"auth\"\\s*:\\s*\"?0\"?").containsMatchIn(body)
+                    val bloqueadaNoServidor = Regex(
+                        "\"status\"\\s*:\\s*\"(Expired|Disabled)\"",
+                        RegexOption.IGNORE_CASE
+                    ).containsMatchIn(body)
+                    if (temUserInfo && !authZero && bloqueadaNoServidor) {
+                        contaExpiradaEhTeste = Regex(
+                            "\"is_trial\"\\s*:\\s*\"?(1|true)\"?",
+                            RegexOption.IGNORE_CASE
+                        ).containsMatchIn(body)
+                        contaExpiradaDetectada = true
+                    }
+
                     val valido = body.contains("user_info") &&
                             body.contains("server_info") &&
                             !body.contains("\"auth\":0") &&
@@ -972,6 +1054,10 @@ class LoginActivity : AppCompatActivity() {
             putString("dns", dns)
             putString("username", user)
             putString("password", pass)
+            // ✅ CORREÇÃO: agora que a flag de logout não é mais apagada ao
+            // abrir a tela de login (ver onCreate), é AQUI — quando um login
+            // é de fato salvo — que ela deixa de valer.
+            remove("logout_requested")
             apply()
         }
         XtreamApi.salvarDns(this, dns)
