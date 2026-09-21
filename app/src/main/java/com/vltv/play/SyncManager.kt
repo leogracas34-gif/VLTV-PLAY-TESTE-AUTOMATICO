@@ -268,6 +268,10 @@ object SyncManager {
             Log.d("SyncManager", "⏱ $etapa: ${System.currentTimeMillis() - t0}ms desde o início da sincronização")
         }
 
+        // ✅ NOVO: a lista de canais AO VIVO roda em paralelo, mas FORA do
+        // caminho crítico da Home (ver comentário mais abaixo).
+        var liveJob: kotlinx.coroutines.Deferred<*>? = null
+
         try {
             // ⚠️ CORREÇÃO (selos somem sozinhos / só aparecem depois de
             // reinstalar): insertVodStreams/insertSeriesStreams usam
@@ -328,6 +332,22 @@ object SyncManager {
             val vodsCompletos: List<VodEntity>
             val seriesCompletos: List<SeriesEntity>
 
+            // ✅ CORRIGIDO (abas "Filmes para você", "Séries para você" e
+            // "Novidades" demorando muito na 1ª instalação): a Home só era
+            // avisada quando a sincronização INTEIRA terminava — e a
+            // sincronização inteira esperava a lista de canais AO VIVO
+            // (baixada direto do Xtream, sem cache do backend, sem
+            // timeout), que passou a ser a etapa mais lenta depois que o
+            // catálogo de filmes/séries começou a vir pronto do backend.
+            // Agora:
+            //  1) Live roda em paralelo mas isolada (scope.async com
+            //     SupervisorJob): não segura mais o resto, e se falhar não
+            //     derruba a sincronização de filmes/séries.
+            //  2) Assim que filmes e séries estão gravados, a Home é
+            //     avisada NA HORA (as 3 fileiras leem exatamente isso).
+            //  3) Só no fim esperamos o Live terminar.
+            liveJob = scope.async { sincronizarLive(db, dns, user, pass) }
+
             coroutineScope {
                 val vodJob = async {
                     val vodArray = catalogoBackend?.vodArray
@@ -339,13 +359,12 @@ object SyncManager {
                         ?: buscarArrayXtream(dns, user, pass, "get_series")
                     sincronizarSeries(db, seriesArray, palavrasProibidas, seriesExistentes)
                 }
-                val liveJob = async { sincronizarLive(db, dns, user, pass) }
 
                 vodsCompletos = vodJob.await()
                 seriesCompletos = seriesJob.await()
-                liveJob.await()
             }
-            logTempo("VOD + Séries + Live (Xtream ou catálogo do backend, em paralelo)")
+            logTempo("VOD + Séries (Xtream ou catálogo do backend, em paralelo)")
+            notificarOuvintes()
 
             // ── TMDB (nomes oficiais + top10/novidades) ─────────────────────
             // ⚠️ CORRIGIDO: antes, "já enviei o catálogo pra esse domínio"
@@ -423,9 +442,20 @@ object SyncManager {
             ContentRepository.atualizarVods(vodsFinal)
             ContentRepository.atualizarSeries(seriesFinal)
             logTempo("FIM da sincronização (ContentRepository atualizado)")
+            notificarOuvintes()
+
+            // Canais ao vivo: só agora esperamos (já rodava em paralelo desde
+            // o início). Falha aqui não afeta filmes/séries.
+            try {
+                liveJob?.await()
+                logTempo("Live (canais ao vivo) concluído")
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
 
         } catch (e: Exception) {
             e.printStackTrace()
+            liveJob?.cancel()
         }
     }
 
