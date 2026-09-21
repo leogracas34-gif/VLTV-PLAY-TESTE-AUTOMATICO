@@ -370,8 +370,14 @@ object SyncManager {
             var aplicadoPeloBackend = false
             try {
                 if (catalogoBackend == null && !jaEnviouCatalogoAntes) {
-                    HomeApiClient.enviarCatalogo(dns, vodsCompletos, seriesCompletos)
-                    prefsBackend.edit().putBoolean(chaveJaEnviou, true).apply()
+                    // ✅ CORRIGIDO: só marca "já enviei" se o backend realmente
+                    // recebeu (enviarCatalogo devolve false em timeout/erro).
+                    // Antes marcava sempre — um upload que falhava uma vez
+                    // deixava o backend sem o catálogo desse painel pra sempre.
+                    val enviou = HomeApiClient.enviarCatalogo(dns, vodsCompletos, seriesCompletos)
+                    if (enviou) {
+                        prefsBackend.edit().putBoolean(chaveJaEnviou, true).apply()
+                    }
                 }
                 logTempo("enviarCatalogo (só roda na 1ª vez que este app vê esse painel)")
                 val resultadoBackend = HomeApiClient.buscarHome(dns)
