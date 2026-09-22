@@ -30,6 +30,7 @@ data class XtreamLoginResponse(val user_info: UserInfo?, val server_info: Server
 data class UserInfo(
     val username: String?,
     val status: String?,
+    val auth: String?,
     val exp_date: String?,
     val max_connections: String?,
     val active_cons: String?,
