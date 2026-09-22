@@ -28,6 +28,7 @@ import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.TextView
+import android.widget.Toast
 import androidx.appcompat.app.AlertDialog
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -57,7 +58,10 @@ import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
+import kotlin.coroutines.resumeWithException
 import org.json.JSONObject
 import java.net.URL
 import java.net.URLEncoder
@@ -198,6 +202,11 @@ class HomeActivity : AppCompatActivity() {
 
         @Volatile private var ultimoFetchRemoteConfigMs = 0L
         private const val INTERVALO_MINIMO_FETCH_MS = 30_000L
+
+        // ✅ NOVO: checagem de validade da conta (teste/assinatura) em
+        // segundo plano — ver verificarValidadeContaEmSegundoPlano().
+        @Volatile private var ultimoCheckValidadeContaMs = 0L
+        private const val INTERVALO_MINIMO_CHECK_VALIDADE_MS = 5L * 60 * 1000
 
         private const val TMDB_TIMEOUT_MS = 8000
     }
@@ -1973,6 +1982,18 @@ class HomeActivity : AppCompatActivity() {
                         "A tela vai continuar mostrando a ÚLTIMA config que foi ativada com sucesso " +
                         "até esse tempo passar. Evite reabrir o app repetidamente enquanto testa."
                     )
+                    // ✅ Aviso visível na tela (sem depender de Logcat): mostra
+                    // por quanto tempo o Firebase vai bloquear novas buscas de
+                    // Remote Config. Enquanto durar, mudanças feitas no console
+                    // (ex: nova URL de imagem do banner) não vão aparecer.
+                    if (!isFinishing && !isDestroyed) {
+                        val minutos = liberaEmS / 60
+                        val msg = if (minutos >= 1)
+                            "Firebase bloqueou novas atualizações por ~${minutos}min (muitos testes seguidos). A config antiga continua na tela até liberar."
+                        else
+                            "Firebase bloqueou novas atualizações por ~${liberaEmS}s (muitos testes seguidos)."
+                        Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
+                    }
                 } else {
                     android.util.Log.w(
                         "VLTV_RemoteConfig",
@@ -2453,6 +2474,13 @@ class HomeActivity : AppCompatActivity() {
                 }
             }
 
+            // ✅ NOVO: confere em segundo plano (sem tela de espera, sem
+            // travar nada) se o teste/assinatura ainda está válido. Só se o
+            // servidor CONFIRMAR expiração é que desloga e volta pra tela
+            // de login com a mensagem — qualquer falha de rede/timeout é
+            // ignorada silenciosamente e tenta de novo no próximo onResume.
+            verificarValidadeContaEmSegundoPlano()
+
             val prefs = getSharedPreferences("vltv_prefs", Context.MODE_PRIVATE)
             currentProfile = prefs.getString("last_profile_name", currentProfile) ?: "Padrao"
             currentProfileIcon = prefs.getString("last_profile_icon", currentProfileIcon)
@@ -2708,6 +2736,81 @@ class HomeActivity : AppCompatActivity() {
             }
             .setNegativeButton("Não", null)
             .show()
+    }
+
+    // ============================================================================
+    // ✅ NOVO: checagem de validade da conta em segundo plano — roda a cada
+    // 5 min (no máximo) enquanto a Home estiver aberta, sem nenhuma tela de
+    // espera. Se o servidor confirmar que expirou, desloga e volta pro
+    // login com a mensagem certa; se não der pra checar (sem internet,
+    // timeout), não faz nada e tenta de novo no próximo onResume.
+    // ============================================================================
+    private fun verificarValidadeContaEmSegundoPlano() {
+        val agora = System.currentTimeMillis()
+        if (agora - ultimoCheckValidadeContaMs < INTERVALO_MINIMO_CHECK_VALIDADE_MS) return
+        ultimoCheckValidadeContaMs = agora
+
+        val prefs = getSharedPreferences("vltv_prefs", Context.MODE_PRIVATE)
+        val user = prefs.getString("username", null)
+        val pass = prefs.getString("password", null)
+        val dns  = prefs.getString("dns", null)
+        if (user.isNullOrBlank() || pass.isNullOrBlank() || dns.isNullOrBlank()) return
+
+        lifecycleScope.launch(Dispatchers.IO) {
+            try {
+                XtreamApi.setBaseUrl(dns)
+                val resultado = withTimeoutOrNull(8_000L) {
+                    val call = XtreamApi.service.login(user, pass)
+                    val response = suspendCancellableCoroutine<retrofit2.Response<XtreamLoginResponse>> { cont ->
+                        cont.invokeOnCancellation { call.cancel() }
+                        call.enqueue(object : retrofit2.Callback<XtreamLoginResponse> {
+                            override fun onResponse(c: retrofit2.Call<XtreamLoginResponse>, r: retrofit2.Response<XtreamLoginResponse>) {
+                                if (cont.isActive) cont.resume(r) {}
+                            }
+                            override fun onFailure(c: retrofit2.Call<XtreamLoginResponse>, t: Throwable) {
+                                if (cont.isActive) cont.resumeWithException(t)
+                            }
+                        })
+                    }
+                    val userInfo = response.body()?.user_info ?: return@withTimeoutOrNull null
+
+                    val info = PlanoUtils.classificarPlano(userInfo.exp_date)
+                    val statusExpirado = userInfo.status?.equals("Expired", ignoreCase = true) == true ||
+                            userInfo.status?.equals("Disabled", ignoreCase = true) == true
+                    val authZero = userInfo.auth?.trim() == "0"
+                    val ehTeste = userInfo.is_trial == "1" ||
+                            userInfo.is_trial?.equals("true", ignoreCase = true) == true
+
+                    Pair(info.isExpirado || statusExpirado || authZero, ehTeste)
+                }
+
+                if (resultado?.first == true) {
+                    withContext(Dispatchers.Main) {
+                        deslogarPorContaExpirada(resultado.second)
+                    }
+                }
+            } catch (e: Exception) {
+                // sem internet, servidor lento, etc. — ignora e tenta de
+                // novo no próximo onResume
+            }
+        }
+    }
+
+    private fun deslogarPorContaExpirada(ehTeste: Boolean) {
+        if (isFinishing || isDestroyed) return
+        getSharedPreferences("vltv_prefs", Context.MODE_PRIVATE).edit().clear().apply()
+        getSharedPreferences("vltv_home_prefs", Context.MODE_PRIVATE).edit().clear().apply()
+        getSharedPreferences("vltv_favoritos", Context.MODE_PRIVATE).edit().clear().apply()
+        getSharedPreferences("vltv_logos_cache", Context.MODE_PRIVATE).edit().clear().apply()
+        getSharedPreferences("vltv_text_cache", Context.MODE_PRIVATE).edit().clear().apply()
+        ContentRepository.limpar()
+        SyncManager.resetarSessao()
+        val intent = Intent(this, LoginActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK
+            putExtra("CONTA_EXPIRADA", if (ehTeste) "teste" else "pagante")
+        }
+        startActivity(intent)
+        finish()
     }
 
     override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
