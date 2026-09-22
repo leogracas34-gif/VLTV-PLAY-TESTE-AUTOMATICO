@@ -138,10 +138,15 @@ class SettingsActivity : AppCompatActivity() {
         "http://supertv.red",
         "http://kodexk.click",
         "http://maisplaytech.space",
-        "http://pthdtv.top",
         "http://pthdtv.sbs",
+        "http://pthdtv.top",
         "http://cdnsec.cyou",
         "http://fx12.sbs",
+        "http://anotaai.lol",
+        "http://brtx.beauty",
+        "http://fuiali.vip",
+        "http://dogshow.club",
+        "http://cdnsec.click",
         "http://cybertronplay.space"
     )
 
