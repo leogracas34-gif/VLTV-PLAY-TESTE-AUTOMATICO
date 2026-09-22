@@ -200,16 +200,6 @@ class HomeActivity : AppCompatActivity() {
         private const val INTERVALO_MINIMO_FETCH_MS = 30_000L
 
         private const val TMDB_TIMEOUT_MS = 8000
-
-        // ✅ NOVO: abaixo deste número de itens locais, o catálogo ainda é
-        // só o "lote mínimo" (preCarregarLoteMinimo, no máximo 12 filmes +
-        // 12 séries, sem ordenação nem curadoria) inserido na hora do
-        // login pra não deixar o Room 100% vazio enquanto a sincronização
-        // completa (SyncManager) não termina. Usado por
-        // popularTelaDoRepositorio() pra decidir se já vale a pena montar
-        // a tela ou se é melhor esperar a próxima chamada (disparada pelo
-        // SyncManager quando o catálogo de verdade chegar).
-        private const val LIMIAR_CATALOGO_MINIMO = 20
     }
 
     private class UntintableDrawable(private val base: Drawable) : Drawable() {
@@ -477,24 +467,6 @@ class HomeActivity : AppCompatActivity() {
 
         if (localMovies.isEmpty() && localSeries.isEmpty()) {
             carregarDadosLocaisImediato()
-            return
-        }
-
-        // ✅ NOVO: evita desenhar a Home com o "lote mínimo" (até 12
-        // filmes + 12 séries crus, sem ordenação nem curadoria — inserido
-        // pelo preCarregarLoteMinimo logo após o login, só pra o Room não
-        // ficar 100% vazio enquanto a sincronização completa não termina).
-        // Antes disso, fileiras como "Filmes/Séries Para Você" e
-        // "Novidades" mostravam esse lote cru por alguns segundos (às
-        // vezes até 1 minuto) — inclusive títulos sem pôster de verdade,
-        // caindo no ícone genérico "VL+" — até o SyncManager terminar e
-        // notificar esta tela pra redesenhar com o catálogo de verdade.
-        // Agora, com menos que LIMIAR_CATALOGO_MINIMO itens, a tela
-        // simplesmente espera essa próxima chamada — exatamente o mesmo
-        // comportamento que o Top 10 Brasil já tinha (fica sem mostrar
-        // nada até o dado de verdade existir, nunca mostra uma versão
-        // errada no meio do caminho).
-        if (localMovies.size < LIMIAR_CATALOGO_MINIMO && localSeries.size < LIMIAR_CATALOGO_MINIMO) {
             return
         }
 
@@ -1572,16 +1544,8 @@ class HomeActivity : AppCompatActivity() {
         lifecycleScope.launch(Dispatchers.IO) {
             try {
                 val localMovies = database.streamDao().getRecentVods(60)
-                val localSeries = database.streamDao().getRecentSeries(60)
-
-                // ✅ Mesmo limiar de popularTelaDoRepositorio() — evita
-                // desenhar a Home com o lote mínimo cru quando o Room
-                // ainda só tem o que preCarregarLoteMinimo inseriu.
-                if (localMovies.size < LIMIAR_CATALOGO_MINIMO && localSeries.size < LIMIAR_CATALOGO_MINIMO) {
-                    return@launch
-                }
-
                 val movieItems = localMovies.map { it.paraItem() }
+                val localSeries = database.streamDao().getRecentSeries(60)
                 val seriesItems = localSeries.map { it.paraItem() }
                 withContext(Dispatchers.Main) {
                     if (isFinishing || isDestroyed) return@withContext
@@ -1663,16 +1627,31 @@ class HomeActivity : AppCompatActivity() {
         imgLogo: ImageView,
         tvTitle: TextView,
         backdropUrl: String,
+        fallbackIcon: String,
         logoUrl: String?,
         cleanTitle: String
     ) {
         imgBanner.scaleType = ImageView.ScaleType.CENTER_CROP
         try {
-            Glide.with(this@HomeActivity)
-                .load(backdropUrl)
+            // ✅ Cadeia de fallback: tenta o backdrop do TMDB/VPS primeiro; se
+            // essa imagem falhar (URL quebrada, caminho salvo errado, proxy
+            // fora do ar), cai pra capa do Xtream (a mesma que já funciona
+            // nas abas de Filmes/Séries) em vez de deixar o banner vazio.
+            // Só mostra o placeholder cinza se nenhuma das duas existir.
+            val fallbackRequest = Glide.with(this@HomeActivity)
+                .load(fallbackIcon.takeIf { it.isNotBlank() })
                 .centerCrop()
                 .format(DecodeFormat.PREFER_RGB_565)
                 .diskCacheStrategy(DiskCacheStrategy.ALL)
+                .error(R.drawable.bg_logo_placeholder)
+
+            Glide.with(this@HomeActivity)
+                .load(backdropUrl.takeIf { it.isNotBlank() })
+                .centerCrop()
+                .format(DecodeFormat.PREFER_RGB_565)
+                .diskCacheStrategy(DiskCacheStrategy.ALL)
+                .placeholder(R.drawable.bg_logo_placeholder)
+                .error(fallbackRequest)
                 .dontAnimate()
                 .into(imgBanner)
         } catch (e: Exception) {}
@@ -1763,14 +1742,14 @@ class HomeActivity : AppCompatActivity() {
                 }
             } catch (e: Exception) {}
 
-            val backdropFinal = backdropUrl ?: fallbackIcon
+            val backdropFinal = backdropUrl ?: ""
 
             bannerAssetsCache[chaveCache] = BannerAssets(backdropUrl, logoUrl, cleanTitle)
 
             withContext(Dispatchers.Main) {
                 if (isFinishing || isDestroyed) return@withContext
                 if (requestId != bannerRequestId) return@withContext
-                aplicarBannerCompleto(imgBanner, imgLogo, tvTitle, backdropFinal, logoUrl, cleanTitle)
+                aplicarBannerCompleto(imgBanner, imgLogo, tvTitle, backdropFinal, fallbackIcon, logoUrl, cleanTitle)
             }
         }
     }
@@ -2903,11 +2882,11 @@ class HomeActivity : AppCompatActivity() {
 
                 val cacheado = bannerAssetsCache[chaveCache]
                 if (cacheado != null) {
-                    aplicarBannerCompleto(imgBanner, imgLogo, tvTitle, cacheado.backdropUrl ?: icon, cacheado.logoUrl, cacheado.cleanTitle)
+                    aplicarBannerCompleto(imgBanner, imgLogo, tvTitle, cacheado.backdropUrl ?: "", icon, cacheado.logoUrl, cacheado.cleanTitle)
                     return
                 }
 
-                aplicarBannerCompleto(imgBanner, imgLogo, tvTitle, icon, null, cleanTitle)
+                aplicarBannerCompleto(imgBanner, imgLogo, tvTitle, icon, icon, null, cleanTitle)
 
                 resolverEAplicarBannerCompleto(
                     titulo = title, cleanTitle = cleanTitle, isSeries = isSeries, id = id,
