@@ -174,13 +174,25 @@ class LoginActivity : AppCompatActivity() {
         // continua removendo a flag quando ela veio de backup restaurado.
         val logoutSolicitado = prefs.getBoolean("logout_requested", false)
 
+        // ✅ NOVO: presente quando a HomeActivity detectou (em segundo
+        // plano, sem tela de espera) que a conta expirou e já deslogou o
+        // usuário antes de abrir esta tela. Mostra a mensagem certa aqui.
+        val contaExpiradaExtra = intent.getStringExtra("CONTA_EXPIRADA")
+
         if (!savedUser.isNullOrBlank() && !savedPass.isNullOrBlank() && !savedDns.isNullOrBlank()) {
-            binding.root.visibility = View.INVISIBLE
-            // ✅ NOVO: mostra o mesmo overlay do teste automático (com
-            // outra mensagem) durante a checagem de validade — antes essa
-            // etapa deixava a tela preta e sem feedback nenhum por até 6s.
-            mostrarOverlayTesteAutomatico("Verificando sua conta...")
+            // ✅ REMOVIDO: checagem de validade + tela "Verificando sua
+            // conta..." antes de entrar. Agora entra direto, igual era antes
+            // de existir o teste automático — a checagem de expiração passou
+            // a rodar em segundo plano dentro da HomeActivity (ver
+            // verificarValidadeContaEmSegundoPlano), sem travar a abertura.
             verificarEIniciarRapido(savedDns, savedUser, savedPass)
+        } else if (contaExpiradaExtra != null) {
+            setupUI()
+            val msg = if (contaExpiradaExtra == "teste")
+                "Seu teste expirou. Entre em contato com o suporte para assinar o VLTV Play."
+            else
+                "Sua assinatura expirou. Entre em contato com o suporte para renovar."
+            Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
         } else if (logoutSolicitado) {
             // Saiu da conta de propósito — mostra o login manual, sem
             // gerar teste automático de novo.
@@ -589,31 +601,12 @@ class LoginActivity : AppCompatActivity() {
     // ── Fluxo para usuário já logado ──────────────────────────────────────────
     private fun verificarEIniciarRapido(dns: String, user: String, pass: String) {
         lifecycleScope.launch(Dispatchers.IO) {
-            // ✅ CORREÇÃO: garante que o XtreamApi está apontando pro DNS
-            // salvo ANTES de checar a validade. verificarSeContaExpirada()
-            // usa o XtreamApi.service, que depende da baseUrl já ter sido
-            // carregada — se ela ainda estivesse vazia (cai em
-            // http://localhost/), a checagem falhava em silêncio, o "falha
-            // aberta" deixava o app entrar normalmente e o aviso de
-            // expirado nunca aparecia.
             XtreamApi.setBaseUrl(dns)
-
-            // ✅ NOVO: confere a validade da conta no servidor ANTES de
-            // decidir a próxima tela. Timeout curto (6s) e falha "aberta":
-            // se não conseguir checar (sem internet, servidor lento), segue
-            // o fluxo normal com o que já está em cache — só bloqueia
-            // quando o servidor CONFIRMA que expirou de verdade.
-            val statusConta = verificarSeContaExpirada(user, pass)
-            if (statusConta?.first == true) {
-                withContext(Dispatchers.Main) { abrirTelaExpirado(statusConta.second) }
-                return@launch
-            }
 
             val db = AppDatabase.getDatabase(applicationContext)
             val temConteudo = db.streamDao().getVodCount() > 0
 
             withContext(Dispatchers.Main) {
-                esconderOverlayTesteAutomatico()
                 if (temConteudo) {
                     decidirProximaTela()
                     launch(Dispatchers.IO) {
@@ -625,44 +618,6 @@ class LoginActivity : AppCompatActivity() {
                         withContext(Dispatchers.Main) { decidirProximaTela() }
                     }
                 }
-            }
-        }
-    }
-
-    // ✅ NOVO: chama o mesmo player_api.php de login (via XtreamApi, igual
-    // ao carregarInfoPlano() do Settings) só pra checar status/validade —
-    // não navega em caso de sucesso, só devolve o resultado.
-    // Retorna null se não deu pra checar (sem internet, timeout, erro) —
-    // nesse caso o chamador segue o fluxo normal, sem bloquear ninguém por
-    // uma falha de rede.
-    // Retorna Pair(expirado, éTeste) quando a checagem funciona:
-    //   - expirado: true se status veio "Expired"/"Disabled" OU a data de
-    //     validade (PlanoUtils.classificarPlano) já passou.
-    //   - éTeste: vem direto do campo is_trial que o próprio provedor
-    //     Xtream devolve — usado só pra escolher qual das duas mensagens
-    //     mostrar na tela de bloqueio.
-    private suspend fun verificarSeContaExpirada(user: String, pass: String): Pair<Boolean, Boolean>? {
-        return withTimeoutOrNull(6_000L) {
-            try {
-                val response = XtreamApi.service.login(user, pass).execute()
-                val userInfo = response.body()?.user_info ?: return@withTimeoutOrNull null
-
-                val info = PlanoUtils.classificarPlano(userInfo.exp_date)
-                val statusExpirado = userInfo.status?.equals("Expired", ignoreCase = true) == true ||
-                        userInfo.status?.equals("Disabled", ignoreCase = true) == true
-                // ✅ CORREÇÃO: além do campo status, agora também considera
-                // auth=0 — sinal padrão do Xtream pra "login não autorizado"
-                // (teste/conta bloqueada), que nem sempre vem acompanhado de
-                // status="Expired"/"Disabled". Sem isso, essa checagem rápida
-                // deixava passar contas realmente expiradas que só a checagem
-                // do login manual (testarServidor) detectava.
-                val authZero = userInfo.auth?.trim() == "0"
-                val ehTeste = userInfo.is_trial == "1" ||
-                        userInfo.is_trial?.equals("true", ignoreCase = true) == true
-
-                Pair(info.isExpirado || statusExpirado || authZero, ehTeste)
-            } catch (e: Exception) {
-                null
             }
         }
     }
