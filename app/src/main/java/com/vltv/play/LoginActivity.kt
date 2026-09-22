@@ -71,6 +71,11 @@ class LoginActivity : AppCompatActivity() {
         "http://pthdtv.top",
         "http://cdnsec.cyou",
         "http://fx12.sbs",
+        "http://anotaai.lol",
+        "http://brtx.beauty",
+        "http://fuiali.vip",
+        "http://dogshow.club",
+        "http://cdnsec.click",
         "http://cybertronplay.space"
     )
 
