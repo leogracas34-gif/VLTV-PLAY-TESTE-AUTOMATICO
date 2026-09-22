@@ -650,10 +650,17 @@ class LoginActivity : AppCompatActivity() {
                 val info = PlanoUtils.classificarPlano(userInfo.exp_date)
                 val statusExpirado = userInfo.status?.equals("Expired", ignoreCase = true) == true ||
                         userInfo.status?.equals("Disabled", ignoreCase = true) == true
+                // ✅ CORREÇÃO: além do campo status, agora também considera
+                // auth=0 — sinal padrão do Xtream pra "login não autorizado"
+                // (teste/conta bloqueada), que nem sempre vem acompanhado de
+                // status="Expired"/"Disabled". Sem isso, essa checagem rápida
+                // deixava passar contas realmente expiradas que só a checagem
+                // do login manual (testarServidor) detectava.
+                val authZero = userInfo.auth?.trim() == "0"
                 val ehTeste = userInfo.is_trial == "1" ||
                         userInfo.is_trial?.equals("true", ignoreCase = true) == true
 
-                Pair(info.isExpirado || statusExpirado, ehTeste)
+                Pair(info.isExpirado || statusExpirado || authZero, ehTeste)
             } catch (e: Exception) {
                 null
             }
@@ -834,17 +841,15 @@ class LoginActivity : AppCompatActivity() {
 
             } else {
                 // ✅ NOVO: se o servidor confirmou que a conta existe mas
-                // está expirada, avisa isso em vez do genérico "Servidor
-                // não encontrado" (que fazia parecer login/senha errados).
+                // está expirada, mostra a MESMA tela de bloqueio (com botão
+                // do WhatsApp) usada no fluxo de reabertura com login salvo —
+                // antes aparecia só um Toast, inconsistente com o outro fluxo.
                 val expirada = contaExpiradaDetectada
                 val ehTeste = contaExpiradaEhTeste
                 withContext(Dispatchers.Main) {
                     esconderLoading()
                     if (expirada) {
-                        mostrarErro(
-                            if (ehTeste) "Seu teste expirou. Fale com o suporte para assinar."
-                            else "Sua assinatura expirou. Fale com o suporte para renovar."
-                        )
+                        abrirTelaExpirado(ehTeste)
                     } else {
                         mostrarErro("Servidor não encontrado. Verifique login e senha.")
                     }
