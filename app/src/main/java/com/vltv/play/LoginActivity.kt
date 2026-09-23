@@ -504,7 +504,18 @@ class LoginActivity : AppCompatActivity() {
                         if (r != null) canal.trySend(r)
                     }
                 }
-                dnsVencedor = withTimeoutOrNull(18_000L) { canal.receive() }
+                // ✅ CORREÇÃO (loop de 5 minutos no teste expirado): antes
+                // esperava os 18s inteiros com withTimeoutOrNull(18_000L),
+                // mesmo que algum servidor já tivesse confirmado a
+                // expiração da conta bem antes disso. Agora faz polling em
+                // fatias de 300ms e sai assim que contaExpiradaDetectada
+                // vira true, sem esperar o teto de 18s à toa.
+                val inicioEspera = System.currentTimeMillis()
+                while (System.currentTimeMillis() - inicioEspera < 18_000L) {
+                    val recebido = withTimeoutOrNull(300L) { canal.receive() }
+                    if (recebido != null) { dnsVencedor = recebido; break }
+                    if (contaExpiradaDetectada) break
+                }
                 jobs.forEach { it.cancel() }
                 canal.close()
             } catch (e: Exception) {
@@ -515,8 +526,17 @@ class LoginActivity : AppCompatActivity() {
             // adianta rodar o fallback lento em todos os servidores.
             if (dnsVencedor == null && !contaExpiradaDetectada) {
                 for (servidor in SERVERS) {
+                    // ✅ CORREÇÃO (bug principal do "5 minutos rodando"): o
+                    // loop antigo só checava contaExpiradaDetectada ANTES de
+                    // começar — depois de detectada a expiração num dos
+                    // primeiros servidores, ele continuava testando todos os
+                    // demais (até 20, com timeout de até 25s+25s cada) antes
+                    // de desistir. Agora sai do loop imediatamente assim que
+                    // um servidor confirma a expiração, em vez de continuar
+                    // batendo nos servidores restantes à toa.
+                    if (contaExpiradaDetectada) break
                     dnsVencedor = testarServidor(servidor, user, pass, clientLento)
-                    if (dnsVencedor != null) break
+                    if (dnsVencedor != null || contaExpiradaDetectada) break
                 }
             }
 
@@ -744,7 +764,15 @@ class LoginActivity : AppCompatActivity() {
                         if (r != null) canal.trySend(r)
                     }
                 }
-                dnsVencedor = withTimeoutOrNull(18_000L) { canal.receive() }
+                // ✅ CORREÇÃO (mesmo bug do teste automático): polling em
+                // fatias de 300ms em vez de esperar o teto de 18s inteiro,
+                // saindo assim que a expiração é confirmada.
+                val inicioEspera = System.currentTimeMillis()
+                while (System.currentTimeMillis() - inicioEspera < 18_000L) {
+                    val recebido = withTimeoutOrNull(300L) { canal.receive() }
+                    if (recebido != null) { dnsVencedor = recebido; break }
+                    if (contaExpiradaDetectada) break
+                }
                 jobs.forEach { it.cancel() }
                 canal.close()
             } catch (e: Exception) {
@@ -760,8 +788,13 @@ class LoginActivity : AppCompatActivity() {
             // o fallback — não adianta insistir.
             if (dnsVencedor == null && !contaExpiradaDetectada) {
                 for (servidor in SERVERS) {
+                    // ✅ CORREÇÃO: sai do loop assim que a expiração é
+                    // confirmada, em vez de continuar testando os servidores
+                    // restantes à toa (mesmo bug do teste automático).
+                    if (contaExpiradaDetectada) break
                     val r = testarServidor(servidor, user, pass, clientLento)
                     if (r != null) { dnsVencedor = r; break }
+                    if (contaExpiradaDetectada) break
                 }
             }
 
