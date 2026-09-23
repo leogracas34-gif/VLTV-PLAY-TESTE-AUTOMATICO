@@ -89,26 +89,6 @@ class LoginActivity : AppCompatActivity() {
     @Volatile private var contaExpiradaDetectada = false
     @Volatile private var contaExpiradaEhTeste = false
 
-    // ✅ TEMPORÁRIO — diagnóstico do bug "supertv.red/sivimcdn.click não
-    // conectam no app mas funcionam em outro player": mostra um Toast com
-    // o código HTTP real (ou a exceção) só pra esses domínios, sem afetar
-    // os outros. Remover DOMINIOS_DEBUG (ou esvaziar a lista) depois de
-    // identificar a causa.
-    private val DOMINIOS_DEBUG = listOf("supertv.red", "sivimcdn.click")
-
-    private fun logDebugDominio(baseUrl: String, mensagem: String) {
-        if (DOMINIOS_DEBUG.none { baseUrl.contains(it, ignoreCase = true) }) return
-        runOnUiThread {
-            if (isFinishing || isDestroyed) return@runOnUiThread
-            androidx.appcompat.app.AlertDialog.Builder(this)
-                .setTitle("[DEBUG] $baseUrl")
-                .setMessage(mensagem)
-                .setPositiveButton("OK", null)
-                .setCancelable(true)
-                .show()
-        }
-    }
-
     override fun onCreate(savedInstanceState: Bundle?) {
         // ✅ REMOVIDO: installSplashScreen() saiu daqui. A LoginActivity não
         // é mais a porta de entrada do app — quem cobre esse papel agora é
@@ -627,6 +607,7 @@ class LoginActivity : AppCompatActivity() {
                 // supertv.red/sivimcdn.click rejeitava com 403 "Access
                 // denied" por não bater no padrão de UA aceito.
                 .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
+                .header("Accept-Language", "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7")
                 .build()
 
             httpClient.newCall(request).execute().use { response ->
@@ -662,22 +643,13 @@ class LoginActivity : AppCompatActivity() {
                     if (valido) {
                         urlBase
                     } else {
-                        logDebugDominio(baseUrl, "HTTP ${response.code}, resposta: ${body.take(150)}")
                         null
                     }
                 } else {
-                    val corpoErro = try { response.body?.string()?.take(300) } catch (e: Exception) { null }
-                    val server = response.header("Server")
-                    val cfRay = response.header("cf-ray")
-                    logDebugDominio(
-                        baseUrl,
-                        "HTTP ${response.code}\nServer: $server\ncf-ray: $cfRay\nCorpo: $corpoErro"
-                    )
                     null
                 }
             }
         } catch (e: Exception) {
-            logDebugDominio(baseUrl, "Exceção: ${e.javaClass.simpleName} — ${e.message}")
             null
         }
     }
@@ -787,14 +759,26 @@ class LoginActivity : AppCompatActivity() {
         }
     }
 
+    // ✅ CORREÇÃO: mesmo bug do VpnInterceptor (XtreamApi.kt) e do
+    // testarServidor() acima — este pré-carregamento inicial de 12 itens
+    // usava HttpURLConnection com um User-Agent de navegador INCOMPLETO
+    // ("Mozilla/5.0 (Windows NT 10.0; Win64; x64)", sem AppleWebKit/
+    // Chrome/Safari). Em painéis com o bloco "if" de User-Agent no nginx
+    // (ex.: supertv.red, sivimcdn.click), essa chamada também levava 403
+    // "Access Denied" — aí o banco local ficava sem nenhum VOD/série logo
+    // após o login, e o app achava que "não tem conteúdo" ao reabrir,
+    // ficando preso na tela de perfil por alguns segundos até decidir pra
+    // onde ir. Trocado pro mesmo UA completo de Chrome usado no resto do
+    // app, mais Accept-Language.
     private fun buscarJsonLimitado(url: String, maxBytes: Int = 300_000): String? {
         return try {
             val conn = (java.net.URL(url).openConnection() as java.net.HttpURLConnection).apply {
                 connectTimeout = 10_000
                 readTimeout    = 12_000
                 requestMethod  = "GET"
-                setRequestProperty("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
+                setRequestProperty("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
                 setRequestProperty("Accept", "application/json")
+                setRequestProperty("Accept-Language", "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7")
             }
 
             if (conn.responseCode != 200) { conn.disconnect(); return null }
