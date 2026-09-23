@@ -662,7 +662,13 @@ class LoginActivity : AppCompatActivity() {
                         null
                     }
                 } else {
-                    logDebugDominio(baseUrl, "HTTP ${response.code} (não sucesso)")
+                    val corpoErro = try { response.body?.string()?.take(300) } catch (e: Exception) { null }
+                    val server = response.header("Server")
+                    val cfRay = response.header("cf-ray")
+                    logDebugDominio(
+                        baseUrl,
+                        "HTTP ${response.code}\nServer: $server\ncf-ray: $cfRay\nCorpo: $corpoErro"
+                    )
                     null
                 }
             }
