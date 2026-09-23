@@ -89,6 +89,26 @@ class LoginActivity : AppCompatActivity() {
     @Volatile private var contaExpiradaDetectada = false
     @Volatile private var contaExpiradaEhTeste = false
 
+    // ✅ TEMPORÁRIO — diagnóstico do bug "supertv.red/sivimcdn.click não
+    // conectam no app mas funcionam em outro player": mostra um Toast com
+    // o código HTTP real (ou a exceção) só pra esses domínios, sem afetar
+    // os outros. Remover DOMINIOS_DEBUG (ou esvaziar a lista) depois de
+    // identificar a causa.
+    private val DOMINIOS_DEBUG = listOf("supertv.red", "sivimcdn.click")
+
+    private fun logDebugDominio(baseUrl: String, mensagem: String) {
+        if (DOMINIOS_DEBUG.none { baseUrl.contains(it, ignoreCase = true) }) return
+        runOnUiThread {
+            if (isFinishing || isDestroyed) return@runOnUiThread
+            androidx.appcompat.app.AlertDialog.Builder(this)
+                .setTitle("[DEBUG] $baseUrl")
+                .setMessage(mensagem)
+                .setPositiveButton("OK", null)
+                .setCancelable(true)
+                .show()
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         // ✅ REMOVIDO: installSplashScreen() saiu daqui. A LoginActivity não
         // é mais a porta de entrada do app — quem cobre esse papel agora é
@@ -635,10 +655,21 @@ class LoginActivity : AppCompatActivity() {
                             !body.contains("\"auth\":\"0\"") &&
                             !body.contains("\"status\":\"Disabled\"") &&
                             !body.contains("\"status\":\"Expired\"")
-                    if (valido) urlBase else null
-                } else null
+                    if (valido) {
+                        urlBase
+                    } else {
+                        logDebugDominio(baseUrl, "HTTP ${response.code}, resposta: ${body.take(150)}")
+                        null
+                    }
+                } else {
+                    logDebugDominio(baseUrl, "HTTP ${response.code} (não sucesso)")
+                    null
+                }
             }
-        } catch (e: Exception) { null }
+        } catch (e: Exception) {
+            logDebugDominio(baseUrl, "Exceção: ${e.javaClass.simpleName} — ${e.message}")
+            null
+        }
     }
 
     private suspend fun preCarregarLoteMinimo(dns: String, user: String, pass: String) {
