@@ -47,37 +47,13 @@ class LoginActivity : AppCompatActivity() {
 
     private lateinit var binding: ActivityLoginBinding
 
-    // ✅ ÚNICA lista de DNS do app — os 7 servidores realmente em uso.
-    // Antes existia uma segunda lista hardcoded só pro fallback
-    // (dentro de iniciarLoginTurbo), com vários DNS antigos que você já
-    // não usa mais (infiprotec.site, blackdns.shop, tlfp.fun,
-    // telefunplay.xyz, tvblack.shop) e sem alguns que você usa
-    // (cmdtv.casa, cmdtv.pro). Isso fazia a etapa rápida e a etapa de
-    // fallback testarem listas diferentes entre si. Agora o fallback usa
-    // esta mesma lista (SERVERS) — só um lugar pra manter atualizado daqui
-    // pra frente.
-    private val SERVERS = listOf(
-        "http://fibercdn.sbs",
-        "http://ranos.sbs",
-        "http://cmdtv.casa",
-        "http://cmdtv.pro",
-        "http://cmdtv.sbs",
-        "http://cmdtv.top",
-        "http://cmdbr.life",
-        "http://supertv.red",
-        "http://kodexk.click",
-        "http://maisplaytech.space",
-        "http://pthdtv.sbs",
-        "http://pthdtv.top",
-        "http://cdnsec.cyou",
-        "http://fx12.sbs",
-        "http://anotaai.lol",
-        "http://brtx.beauty",
-        "http://fuiali.vip",
-        "http://dogshow.club",
-        "http://cdnsec.click",
-        "http://cybertronplay.space"
-    )
+    // ✅ AGORA DINÂMICA: a lista de DNS vem da VPS (dns_config.json), via
+    // XtreamApi.SERVERS → DnsConfig. Pra trocar/remover/adicionar um DNS,
+    // edite o arquivo na VPS — não precisa mais mexer aqui nem recompilar.
+    // É um getter (sem "="), então cada uso lê a lista mais atual, inclusive
+    // a que acabou de ser baixada por DnsConfig.refresh().
+    private val SERVERS: List<String>
+        get() = XtreamApi.SERVERS
 
     private val clientRapido = OkHttpClient.Builder()
         .connectTimeout(10, TimeUnit.SECONDS)
@@ -134,6 +110,13 @@ class LoginActivity : AppCompatActivity() {
         // PLAY" surgindo letra por letra). O tema desta Activity voltou a
         // ser o normal (Theme.VLTVPlay), configurado no AndroidManifest.
         super.onCreate(savedInstanceState)
+
+        // ✅ NOVO: baixa a lista de DNS mais recente da VPS em segundo plano
+        // assim que o app abre. Se a VPS não responder, segue com a lista
+        // que já estava guardada no aparelho (ou a de emergência embutida).
+        lifecycleScope.launch(Dispatchers.IO) {
+            DnsConfig.refresh(applicationContext)
+        }
 
         // ✅ NOVO: precisa rodar ANTES de ler "vltv_prefs" logo abaixo.
         // Ver explicação completa na função.
@@ -489,6 +472,11 @@ class LoginActivity : AppCompatActivity() {
             }
             val (user, pass) = credenciais
 
+            // ✅ NOVO: garante a lista de DNS mais recente da VPS antes de
+            // testar os servidores (não baixa de novo se já baixou há
+            // menos de 1 minuto, e nunca demora mais que ~8s).
+            DnsConfig.refresh(applicationContext)
+
             // ✅ CORREÇÃO: antes testava os SERVERS um de cada vez
             // (sequencial) — com 15 servidores e timeout de 10s cada, se os
             // primeiros não respondessem rápido, podia passar de 1 minuto
@@ -754,6 +742,11 @@ class LoginActivity : AppCompatActivity() {
             contaExpiradaDetectada = false
             contaExpiradaEhTeste = false
 
+            // ✅ NOVO: garante a lista de DNS mais recente da VPS antes de
+            // testar os servidores (não baixa de novo se já baixou há
+            // menos de 1 minuto, e nunca demora mais que ~8s).
+            DnsConfig.refresh(applicationContext)
+
             var dnsVencedor: String? = null
 
             try {
@@ -781,7 +774,7 @@ class LoginActivity : AppCompatActivity() {
 
             // ✅ Fallback agora usa a MESMA lista (SERVERS), só que com o
             // client mais tolerante (clientLento: timeout maior e retry
-            // ativado) — pra dar uma segunda chance aos mesmos 7 DNS reais
+            // ativado) — pra dar uma segunda chance aos mesmos DNS
             // antes de desistir, em vez de testar servidores que você não
             // usa mais.
             // ✅ Se algum servidor já confirmou que a conta expirou, pula
