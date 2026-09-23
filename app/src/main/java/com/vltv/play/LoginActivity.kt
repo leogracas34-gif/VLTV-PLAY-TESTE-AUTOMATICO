@@ -12,7 +12,6 @@ import android.net.Uri
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
-import android.provider.Settings
 import android.text.InputType
 import android.view.Gravity
 import android.view.MotionEvent
@@ -21,7 +20,6 @@ import android.view.ViewGroup
 import android.view.inputmethod.EditorInfo
 import android.widget.FrameLayout
 import android.widget.LinearLayout
-import android.widget.ProgressBar
 import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
@@ -35,12 +33,9 @@ import com.vltv.play.data.VodEntity
 import com.vltv.play.databinding.ActivityLoginBinding
 import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.Channel
-import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
-import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
-import org.json.JSONObject
 import java.util.concurrent.TimeUnit
 
 class LoginActivity : AppCompatActivity() {
@@ -84,24 +79,6 @@ class LoginActivity : AppCompatActivity() {
     // várias threads ao mesmo tempo (fase rápida em paralelo).
     @Volatile private var contaExpiradaDetectada = false
     @Volatile private var contaExpiradaEhTeste = false
-
-    // ============================================================================
-    // ✅ NOVO: TESTE AUTOMÁTICO — 1ª abertura do app, sem tela de login
-    // ============================================================================
-    // Cada build do app usa UMA lista fixa. Pro app principal (com.vltv.play):
-    // "lista1". Pro segundo app (VLTV-PLAY-NOVA-HOME): trocar esta única
-    // linha para "lista2" — o resto da lógica é idêntico nos dois apps.
-    private val LISTA_TESTE = "lista1"
-
-    // Mesmo domínio do site (vltvplay.tech) — a chave do provedor IPTV fica
-    // só no servidor; o app nunca fala direto com o painel.
-    private val AUTO_TRIAL_URL = "https://vltvplay.tech/api/app-auto-trial"
-
-    private val clientAutoTrial = OkHttpClient.Builder()
-        .connectTimeout(12, TimeUnit.SECONDS)
-        .readTimeout(20, TimeUnit.SECONDS)
-        .retryOnConnectionFailure(false)
-        .build()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         // ✅ REMOVIDO: installSplashScreen() saiu daqui. A LoginActivity não
@@ -181,77 +158,15 @@ class LoginActivity : AppCompatActivity() {
             // gerar teste automático de novo.
             setupUI()
         } else {
-            // ✅ ANTES: caía direto em setupUI() (tela de login manual).
-            // AGORA: tenta primeiro o teste automático em segundo plano.
-            // Enquanto isso roda, mostra um overlay com aviso ("Preparando
-            // seu teste...") em vez de deixar a tela em branco — só some
-            // quando o app já está entrando (nesse caso a Activity é
-            // encerrada) ou quando falha e volta pro login manual.
-            mostrarOverlayTesteAutomatico()
-            iniciarTesteAutomatico()
+            // Sem login salvo, sem flag de expirado/logout — 1ª abertura
+            // (ou instalação nova): mostra a tela de login manual.
+            setupUI()
         }
     }
 
-    // ============================================================================
-    // ✅ NOVO: overlay "Preparando seu teste..." — cobre a tela inteira
-    // enquanto o teste automático roda (chamada ao servidor + busca de DNS),
-    // pra não deixar a 1ª abertura do app com a tela em branco. Adicionado
-    // por cima do layout via addContentView(), então funciona sem precisar
-    // mexer no activity_login.xml nem conhecer sua estrutura interna.
-    // ============================================================================
-    private var overlayTesteAutomatico: View? = null
-
+    // Extensão usada para converter dp em pixels nas telas montadas via
+    // código (ex.: tela de "assinatura/teste expirado" abaixo).
     private val Int.dpToPx: Int get() = (this * resources.displayMetrics.density).toInt()
-
-    private fun mostrarOverlayTesteAutomatico(mensagem: String = "Gerando seu teste automático...") {
-        if (overlayTesteAutomatico != null) return
-
-        val progress = ProgressBar(this).apply {
-            isIndeterminate = true
-            indeterminateTintList = ColorStateList.valueOf(Color.WHITE)
-        }
-
-        val texto = TextView(this).apply {
-            text = mensagem
-            textSize = 14f
-            setTextColor(Color.parseColor("#CCCCCC"))
-            gravity = Gravity.CENTER
-            // ✅ CORREÇÃO DO BUG "Prep": sem isto, o LinearLayout vertical
-            // pai gera um LayoutParams padrão com largura MATCH_PARENT pra
-            // esta TextView — mas como o próprio pai (conteudo) também está
-            // em WRAP_CONTENT, isso criava um conflito de medida que
-            // colapsava a largura do texto quase a zero, cortando a
-            // mensagem logo depois de "Prep". WRAP_CONTENT explícito aqui
-            // resolve, deixando o texto do tamanho real dele.
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.WRAP_CONTENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
-            )
-        }
-
-        val conteudo = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            gravity = Gravity.CENTER
-            addView(progress, LinearLayout.LayoutParams(40.dpToPx, 40.dpToPx).apply { bottomMargin = 16.dpToPx })
-            addView(texto)
-        }
-
-        val overlay = FrameLayout(this).apply {
-            layoutParams = ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
-            setBackgroundColor(Color.parseColor("#080810")) // mesmo fundo escuro usado no resto do app
-            addView(conteudo, FrameLayout.LayoutParams(FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.CENTER))
-        }
-
-        addContentView(overlay, ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
-        overlayTesteAutomatico = overlay
-    }
-
-    // Remove o overlay — chamado só no caminho de falha (o caminho de
-    // sucesso encerra esta Activity antes de precisar disso).
-    private fun esconderOverlayTesteAutomatico() {
-        overlayTesteAutomatico?.let { (it.parent as? ViewGroup)?.removeView(it) }
-        overlayTesteAutomatico = null
-    }
 
     // ✅ NOVO: resolve o caso "desinstalei o app, reinstalei, e o login
     // antigo voltou sozinho". Isso acontece por causa do Auto Backup do
@@ -287,7 +202,7 @@ class LoginActivity : AppCompatActivity() {
     // "saiu de propósito" (setupUI() manual) em vez de tentar o teste
     // automático — mesmo sendo, de fato, uma instalação nova. Removendo
     // essa chave junto com as demais, uma reinstalação de verdade sempre
-    // passa a cair no ramo do teste automático novamente.
+    // passa a cair no ramo do login manual normalmente.
     private fun limparLoginRestauradoSeInstalacaoNova() {
         val marcador = getSharedPreferences("vltv_device_marker", Context.MODE_PRIVATE)
         val jaRodouNesteAparelho = marcador.getBoolean("instalado", false)
@@ -440,172 +355,6 @@ class LoginActivity : AppCompatActivity() {
         binding.etPassword.isEnabled = true
     }
 
-    // ============================================================================
-    // ✅ NOVO: fluxo de teste automático (1ª abertura, sem login salvo)
-    // ============================================================================
-    // 1) Pega o ANDROID_ID do aparelho.
-    // 2) Chama o backend (mesma lógica de geração de teste do site) pedindo
-    //    um teste pra LISTA_TESTE, identificado por esse ANDROID_ID — o
-    //    backend garante que o MESMO aparelho nunca recebe dois testes
-    //    diferentes (reinstalar não gera teste novo).
-    // 3) Com usuário/senha em mãos, testa os mesmos SERVERS já usados no
-    //    login manual pra descobrir o DNS que responde (a Lista 1 nem
-    //    devolve DNS — o app sempre descobriu por conta própria).
-    // 4) Se tudo der certo, salva como se fosse um login manual normal e
-    //    segue pra tela de Perfis.
-    // 5) Qualquer falha em qualquer etapa (sem internet, backend fora do
-    //    ar, credenciais inválidas) cai silenciosamente na tela de login
-    //    manual (setupUI()) — nunca trava o app.
-    //    ✅ NOVO: se a falha for porque o teste recebido JÁ EXPIROU, cai no
-    //    login manual COM um aviso de que o teste expirou.
-    private fun iniciarTesteAutomatico() {
-        lifecycleScope.launch(Dispatchers.IO) {
-            contaExpiradaDetectada = false
-            contaExpiradaEhTeste = false
-
-            val androidId = obterAndroidIdParaTeste()
-
-            val credenciais = solicitarTesteAutomatico(androidId)
-            if (credenciais == null) {
-                withContext(Dispatchers.Main) { esconderOverlayTesteAutomatico(); setupUI() }
-                return@launch
-            }
-            val (user, pass) = credenciais
-
-            // ✅ NOVO: garante a lista de DNS mais recente da VPS antes de
-            // testar os servidores (não baixa de novo se já baixou há
-            // menos de 1 minuto, e nunca demora mais que ~8s).
-            DnsConfig.refresh(applicationContext)
-
-            // ✅ CORREÇÃO: antes testava os SERVERS um de cada vez
-            // (sequencial) — com 15 servidores e timeout de 10s cada, se os
-            // primeiros não respondessem rápido, podia passar de 1 minuto
-            // fácil. Agora usa o MESMO padrão do login manual
-            // (iniciarLoginTurbo): todos em paralelo, com um teto de 18s
-            // pra fase rápida antes de cair no fallback mais tolerante.
-            var dnsVencedor: String? = null
-            try {
-                val canal = Channel<String>(Channel.UNLIMITED)
-                val jobs = SERVERS.map { url ->
-                    launch(Dispatchers.IO) {
-                        val r = testarServidor(url, user, pass, clientRapido)
-                        if (r != null) canal.trySend(r)
-                    }
-                }
-                // ✅ CORREÇÃO (loop de 5 minutos no teste expirado): antes
-                // esperava os 18s inteiros com withTimeoutOrNull(18_000L),
-                // mesmo que algum servidor já tivesse confirmado a
-                // expiração da conta bem antes disso. Agora faz polling em
-                // fatias de 300ms e sai assim que contaExpiradaDetectada
-                // vira true, sem esperar o teto de 18s à toa.
-                val inicioEspera = System.currentTimeMillis()
-                while (System.currentTimeMillis() - inicioEspera < 18_000L) {
-                    val recebido = withTimeoutOrNull(300L) { canal.receive() }
-                    if (recebido != null) { dnsVencedor = recebido; break }
-                    if (contaExpiradaDetectada) break
-                }
-                jobs.forEach { it.cancel() }
-                canal.close()
-            } catch (e: Exception) {
-                e.printStackTrace()
-            }
-
-            // ✅ Se algum servidor já confirmou que a conta expirou, não
-            // adianta rodar o fallback lento em todos os servidores.
-            if (dnsVencedor == null && !contaExpiradaDetectada) {
-                for (servidor in SERVERS) {
-                    // ✅ CORREÇÃO (bug principal do "5 minutos rodando"): o
-                    // loop antigo só checava contaExpiradaDetectada ANTES de
-                    // começar — depois de detectada a expiração num dos
-                    // primeiros servidores, ele continuava testando todos os
-                    // demais (até 20, com timeout de até 25s+25s cada) antes
-                    // de desistir. Agora sai do loop imediatamente assim que
-                    // um servidor confirma a expiração, em vez de continuar
-                    // batendo nos servidores restantes à toa.
-                    if (contaExpiradaDetectada) break
-                    dnsVencedor = testarServidor(servidor, user, pass, clientLento)
-                    if (dnsVencedor != null || contaExpiradaDetectada) break
-                }
-            }
-
-            if (dnsVencedor == null) {
-                // Teste recebido do servidor não bateu em nenhum DNS (pode
-                // acontecer com um teste antigo/expirado reaproveitado após
-                // logout) — não trava o cliente, só mostra o login manual.
-                val testeExpirou = contaExpiradaDetectada
-                withContext(Dispatchers.Main) {
-                    esconderOverlayTesteAutomatico()
-                    setupUI()
-                    // ✅ NOVO: se o motivo foi expiração, avisa em vez de
-                    // simplesmente aparecer o login sem explicação.
-                    if (testeExpirou) {
-                        Toast.makeText(
-                            this@LoginActivity,
-                            "Seu teste expirou. Entre com seu usuário e senha ou fale com o suporte para assinar.",
-                            Toast.LENGTH_LONG
-                        ).show()
-                    }
-                }
-                return@launch
-            }
-
-            val dnsFinal = normalizarBaseUrl(dnsVencedor)
-            salvarCredenciais(dnsFinal, user, pass)
-
-            ContentRepository.recarregar(applicationContext)
-            launch(Dispatchers.IO) { preCarregarLoteMinimo(dnsFinal, user, pass) }
-
-            withContext(Dispatchers.Main) {
-                val intent = Intent(this@LoginActivity, ProfilesActivity::class.java)
-                intent.flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK
-                startActivity(intent)
-                finish()
-            }
-        }
-    }
-
-    // ANDROID_ID: identificador do aparelho, único por app+dispositivo,
-    // sobrevive a reinstalação do app (só muda com reset de fábrica) — é
-    // exatamente o comportamento necessário pra travar abuso de reinstalar
-    // pra ganhar teste novo.
-    @SuppressWarnings("HardwareIds")
-    private fun obterAndroidIdParaTeste(): String {
-        return try {
-            Settings.Secure.getString(contentResolver, Settings.Secure.ANDROID_ID)
-                ?.takeIf { it.isNotBlank() }
-                ?: "sem_android_id"
-        } catch (e: Exception) {
-            "sem_android_id"
-        }
-    }
-
-    private fun solicitarTesteAutomatico(androidId: String): Pair<String, String>? {
-        return try {
-            val bodyJson = JSONObject().apply {
-                put("listId", LISTA_TESTE)
-                put("deviceId", androidId)
-            }
-            val body = bodyJson.toString().toRequestBody("application/json".toMediaType())
-            val request = Request.Builder()
-                .url(AUTO_TRIAL_URL)
-                .post(body)
-                .build()
-
-            clientAutoTrial.newCall(request).execute().use { response ->
-                val raw = response.body?.string()
-                if (!response.isSuccessful || raw.isNullOrBlank()) return null
-
-                val json = JSONObject(raw)
-                val user = json.optString("username", "")
-                val pass = json.optString("password", "")
-                if (user.isBlank() || pass.isBlank()) null else Pair(user, pass)
-            }
-        } catch (e: Exception) {
-            e.printStackTrace()
-            null
-        }
-    }
-
     // ── Fluxo para usuário já logado ──────────────────────────────────────────
     private fun verificarEIniciarRapido(dns: String, user: String, pass: String) {
         lifecycleScope.launch(Dispatchers.IO) {
@@ -633,10 +382,10 @@ class LoginActivity : AppCompatActivity() {
     // ============================================================================
     // ✅ NOVO: tela de bloqueio — assinatura ou teste expirado
     // ============================================================================
-    // Cobre a tela inteira (via addContentView, igual ao overlay do teste
-    // automático) e NÃO tem botão de fechar nem de voltar — só o botão do
-    // WhatsApp. bloqueadoPorExpiracao trava o botão físico/gesto de voltar
-    // do Android enquanto essa tela estiver em cena (ver onBackPressed()).
+    // Cobre a tela inteira (via addContentView) e NÃO tem botão de fechar
+    // nem de voltar — só o botão do WhatsApp. bloqueadoPorExpiracao trava o
+    // botão físico/gesto de voltar do Android enquanto essa tela estiver em
+    // cena (ver onBackPressed()).
     private var bloqueadoPorExpiracao = false
 
     private val WHATSAPP_SUPORTE_NUMERO = "5531998491711"
@@ -644,7 +393,6 @@ class LoginActivity : AppCompatActivity() {
     private fun abrirTelaExpirado(ehTeste: Boolean) {
         if (bloqueadoPorExpiracao) return // já está bloqueado, não duplica a tela
         bloqueadoPorExpiracao = true
-        esconderOverlayTesteAutomatico()
 
         val titulo = if (ehTeste) "Teste expirado" else "Assinatura expirada"
         val mensagem = if (ehTeste)
@@ -757,9 +505,9 @@ class LoginActivity : AppCompatActivity() {
                         if (r != null) canal.trySend(r)
                     }
                 }
-                // ✅ CORREÇÃO (mesmo bug do teste automático): polling em
-                // fatias de 300ms em vez de esperar o teto de 18s inteiro,
-                // saindo assim que a expiração é confirmada.
+                // ✅ CORREÇÃO: polling em fatias de 300ms em vez de esperar
+                // o teto de 18s inteiro, saindo assim que a expiração é
+                // confirmada.
                 val inicioEspera = System.currentTimeMillis()
                 while (System.currentTimeMillis() - inicioEspera < 18_000L) {
                     val recebido = withTimeoutOrNull(300L) { canal.receive() }
@@ -783,7 +531,7 @@ class LoginActivity : AppCompatActivity() {
                 for (servidor in SERVERS) {
                     // ✅ CORREÇÃO: sai do loop assim que a expiração é
                     // confirmada, em vez de continuar testando os servidores
-                    // restantes à toa (mesmo bug do teste automático).
+                    // restantes à toa.
                     if (contaExpiradaDetectada) break
                     val r = testarServidor(servidor, user, pass, clientLento)
                     if (r != null) { dnsVencedor = r; break }
