@@ -1240,13 +1240,23 @@ class SettingsActivity : AppCompatActivity() {
         }
     }
 
+    // ✅ CORREÇÃO: mesmo bug do testarServidor() da LoginActivity e do
+    // VpnInterceptor (XtreamApi.kt) — este testarServidor() (usado só no
+    // fluxo de "Trocar Credenciais") ainda mandava o User-Agent
+    // INCOMPLETO ("Mozilla/5.0 (Windows NT 10.0; Win64; x64)", sem
+    // AppleWebKit/Chrome/Safari), então em painéis como supertv.red e
+    // sivimcdn.click a troca de credenciais também levava 403 "Access
+    // Denied" e caía direto em "Servidor não encontrado", mesmo com
+    // usuário/senha corretos. Trocado pro mesmo UA completo de Chrome
+    // usado em todo o resto do app, mais Accept-Language.
     private fun testarServidor(baseUrl: String, user: String, pass: String, httpClient: OkHttpClient): String? {
         val urlBase     = normalizarBaseUrl(baseUrl)
         val urlSemBarra = urlBase.removeSuffix("/")
         return try {
             val request = Request.Builder()
                 .url("$urlSemBarra/player_api.php?username=$user&password=$pass")
-                .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
+                .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
+                .header("Accept-Language", "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7")
                 .build()
             httpClient.newCall(request).execute().use { response ->
                 if (response.isSuccessful) {
