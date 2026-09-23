@@ -8,9 +8,11 @@ import okhttp3.Dns
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.Interceptor
 import okhttp3.OkHttpClient
+import okhttp3.Request
 import okhttp3.Response
 import okhttp3.ResponseBody
 import okhttp3.dnsoverhttps.DnsOverHttps
+import org.json.JSONObject
 import retrofit2.Call
 import retrofit2.Retrofit
 import retrofit2.converter.gson.GsonConverterFactory
@@ -282,26 +284,27 @@ class DnsFailoverInterceptor : Interceptor {
 }
 
 // ---------------------
-// XtreamApi
+// ✅ NOVO: DnsConfig — lista de DNS controlada pela VPS
 // ---------------------
-object XtreamApi {
+// A lista de servidores agora mora no arquivo dns_config.json da VPS
+// (https://vltvplay.tech/dns_config.json). Pra trocar/remover/adicionar
+// um DNS, basta editar esse arquivo na VPS — o app baixa a lista nova
+// sozinho (ao abrir e antes de cada login), sem precisar recompilar.
+//
+// Ordem de prioridade da lista usada pelo app:
+//   1) última lista baixada da VPS (guardada no aparelho)
+//   2) FALLBACK abaixo — só vale na 1ª abertura do app sem internet ou
+//      se a VPS estiver fora do ar. Mesmo assim, a lista baixada uma vez
+//      continua valendo nas próximas aberturas.
+object DnsConfig {
 
-    private const val PREFS_NAME = "vltv_prefs"
-    private const val PREF_DNS_KEY = "dns"
+    private const val CONFIG_URL = "https://vltvplay.tech/dns_config.json"
+    private const val PREFS_NAME = "vltv_dns_config"
+    private const val KEY_JSON = "servers_json"
+    private const val INTERVALO_MIN_MS = 60_000L
 
-    // ✅ MESMA lista de DNS usada no login (LoginActivity). Fica aqui
-    // como fonte única de verdade, pra não haver risco de duas listas
-    // desatualizadas em lugares diferentes. A LoginActivity pode passar
-    // a referenciar XtreamApi.SERVERS em vez de manter a própria cópia.
-    // ✅ ATUALIZADO: lista sincronizada com a mesma usada em LoginActivity.kt
-    // e SettingsActivity.kt. Os 6 domínios antigos que estavam aqui
-    // (zeroum.pro, shozcdn.site, edgelow.site, cdtune.site,
-    // radiodiamond.site, gort2.site) não existem mais — o
-    // DnsFailoverInterceptor perdia tempo tentando servidores mortos antes
-    // de chegar num válido. fx12.sbs foi incluído: é o único da lista com
-    // nameserver fora da Cloudflare (BunnyCDN), então continua resolvível
-    // mesmo numa queda total do DNS da Cloudflare.
-    val SERVERS = listOf(
+    // Lista de emergência embutida no app (mesma que está hoje na VPS).
+    private val FALLBACK = listOf(
         "http://fibercdn.sbs",
         "http://ranos.sbs",
         "http://cmdtv.casa",
@@ -321,8 +324,111 @@ object XtreamApi {
         "http://fuiali.vip",
         "http://dogshow.club",
         "http://cdnsec.click",
+        "http://sivimcdn.click",
         "http://cybertronplay.space"
     )
+
+    // Client próprio e simples (sem DoH, sem failover) — só pra baixar o
+    // JSON do próprio site. Timeouts curtos pra nunca atrasar o login.
+    private val client: OkHttpClient by lazy {
+        OkHttpClient.Builder()
+            .connectTimeout(5, TimeUnit.SECONDS)
+            .readTimeout(5, TimeUnit.SECONDS)
+            .callTimeout(8, TimeUnit.SECONDS)
+            .retryOnConnectionFailure(false)
+            .build()
+    }
+
+    @Volatile private var cache: List<String>? = null
+    @Volatile private var ultimoRefreshOk = 0L
+
+    private fun getAppContext(): Context? {
+        return try {
+            Class.forName("android.app.ActivityThread")
+                .getMethod("currentApplication")
+                .invoke(null) as? Context
+        } catch (e: Exception) { null }
+    }
+
+    // Lê e valida o JSON: {"servers": ["http://...", ...]}
+    private fun parse(raw: String): List<String>? {
+        return try {
+            val arr = JSONObject(raw).optJSONArray("servers") ?: return null
+            val lista = mutableListOf<String>()
+            for (i in 0 until arr.length()) {
+                val s = arr.optString(i, "").trim()
+                if (s.startsWith("http://") || s.startsWith("https://")) lista.add(s)
+            }
+            lista.distinct().takeIf { it.isNotEmpty() }
+        } catch (e: Exception) { null }
+    }
+
+    // Lista atual — rápida, sem rede. Sempre devolve algo utilizável.
+    fun servers(): List<String> {
+        cache?.let { return it }
+
+        val salva = try {
+            getAppContext()
+                ?.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                ?.getString(KEY_JSON, null)
+                ?.let { parse(it) }
+        } catch (e: Exception) { null }
+
+        if (salva != null) {
+            cache = salva
+            return salva
+        }
+        return FALLBACK
+    }
+
+    // Baixa a lista da VPS. BLOQUEANTE (chamar em thread de fundo/IO).
+    // Devolve true se a lista está atualizada. Se a VPS não responder ou
+    // devolver algo inválido, mantém a lista que já estava valendo.
+    // Não baixa de novo se já deu certo há menos de 1 minuto.
+    @Synchronized
+    fun refresh(context: Context, force: Boolean = false): Boolean {
+        val agora = System.currentTimeMillis()
+        if (!force && agora - ultimoRefreshOk < INTERVALO_MIN_MS) return true
+
+        return try {
+            val request = Request.Builder()
+                .url(CONFIG_URL)
+                .header("Cache-Control", "no-cache")
+                .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
+                .build()
+
+            client.newCall(request).execute().use { response ->
+                if (!response.isSuccessful) return false
+                val raw = response.body?.string().orEmpty()
+                val lista = parse(raw) ?: return false
+
+                context.applicationContext
+                    .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                    .edit().putString(KEY_JSON, raw).apply()
+
+                cache = lista
+                ultimoRefreshOk = agora
+                true
+            }
+        } catch (e: Exception) { false }
+    }
+}
+
+// ---------------------
+// XtreamApi
+// ---------------------
+object XtreamApi {
+
+    private const val PREFS_NAME = "vltv_prefs"
+    private const val PREF_DNS_KEY = "dns"
+
+    // ✅ AGORA DINÂMICA: a lista vem do DnsConfig (arquivo dns_config.json
+    // na VPS, com cópia guardada no aparelho e lista de emergência
+    // embutida). Continua sendo a fonte única de verdade — LoginActivity
+    // e SettingsActivity leem daqui. Pra mudar DNS, edite o arquivo na
+    // VPS; não precisa mais mexer neste código.
+    val SERVERS: List<String>
+        get() = DnsConfig.servers()
 
     private val lock = Any()
     private var baseUrl: String = ""
