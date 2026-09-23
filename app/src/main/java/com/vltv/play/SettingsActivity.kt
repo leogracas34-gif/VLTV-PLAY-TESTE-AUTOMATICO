@@ -117,38 +117,13 @@ class SettingsActivity : AppCompatActivity() {
     // ("Ativado"/"Desativado") sem precisar reconstruir o card inteiro.
     private var tvSubtituloPinPerfis: TextView? = null
 
-    // ✅ CORRIGIDO: antes esta tela tinha SUA PRÓPRIA lista de DNS (SERVERS),
-    // desatualizada e diferente da usada na tela de Login — faltavam DNS
-    // reais em uso (cmdbr.life, zeroum.pro, shozcdn.site, edgelow.site,
-    // cdtune.site, radiodiamond.site, gort2.site) e sobravam vários DNS
-    // mortos (topcdn.fun, starkplay.*, stkplay.*, hostservers.top). Isso
-    // fazia login/senha que só respondiam nos DNS que faltavam aqui darem
-    // "não achou o DNS" em Configurações, mesmo funcionando normalmente na
-    // tela de Login. Agora usa a MESMA lista única da LoginActivity — só um
-    // lugar pra manter atualizado daqui pra frente (se adicionar/remover um
-    // DNS, replicar essa mudança nas duas Activities).
-    private val SERVERS = listOf(
-        "http://fibercdn.sbs",
-        "http://ranos.sbs",
-        "http://cmdtv.casa",
-        "http://cmdtv.pro",
-        "http://cmdtv.sbs",
-        "http://cmdtv.top",
-        "http://cmdbr.life",
-        "http://supertv.red",
-        "http://kodexk.click",
-        "http://maisplaytech.space",
-        "http://pthdtv.sbs",
-        "http://pthdtv.top",
-        "http://cdnsec.cyou",
-        "http://fx12.sbs",
-        "http://anotaai.lol",
-        "http://brtx.beauty",
-        "http://fuiali.vip",
-        "http://dogshow.club",
-        "http://cdnsec.click",
-        "http://cybertronplay.space"
-    )
+    // ✅ AGORA DINÂMICA: a lista de DNS vem da VPS (dns_config.json), via
+    // XtreamApi.SERVERS → DnsConfig — a MESMA lista usada na LoginActivity.
+    // Pra trocar/remover/adicionar um DNS, edite o arquivo na VPS: não
+    // precisa mais mexer aqui nem recompilar o app. É um getter (sem "="),
+    // então cada uso lê a lista mais atual.
+    private val SERVERS: List<String>
+        get() = XtreamApi.SERVERS
 
     private val clientRapido = OkHttpClient.Builder()
         .connectTimeout(10, TimeUnit.SECONDS)
@@ -1218,6 +1193,11 @@ class SettingsActivity : AppCompatActivity() {
         progressDialog.show()
 
         lifecycleScope.launch(Dispatchers.IO) {
+            // ✅ NOVO: garante a lista de DNS mais recente da VPS antes de
+            // testar os servidores (não baixa de novo se já baixou há
+            // menos de 1 minuto, e nunca demora mais que ~8s).
+            DnsConfig.refresh(applicationContext)
+
             var dnsVencedor: String? = null
             try {
                 val canal = Channel<String>(Channel.UNLIMITED)
