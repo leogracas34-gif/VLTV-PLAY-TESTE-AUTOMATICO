@@ -447,7 +447,13 @@ object XtreamApi {
             .build()
     }
 
-    private fun buildSafeDns(): Dns {
+    // ✅ NOVO: não é mais "private" — o LoginActivity agora reaproveita
+    // este mesmo resolvedor DNS-over-HTTPS na fase de teste de login
+    // (clientRapido/clientLento), pra contornar bloqueio de DNS feito
+    // pela operadora em domínios específicos (ex.: supertv.red,
+    // sivimcdn.click), sem duplicar a configuração do DoH em dois
+    // lugares diferentes.
+    fun buildSafeDns(): Dns {
         return try {
             val bootstrapClient = OkHttpClient.Builder().build()
             DnsOverHttps.Builder()
