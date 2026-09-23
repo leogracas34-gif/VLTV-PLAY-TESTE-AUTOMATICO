@@ -50,16 +50,25 @@ class LoginActivity : AppCompatActivity() {
     private val SERVERS: List<String>
         get() = XtreamApi.SERVERS
 
+    // ✅ NOVO: .dns(XtreamApi.buildSafeDns()) — resolve os domínios via
+    // DNS-over-HTTPS (Google/Cloudflare) em vez do DNS padrão da rede do
+    // aparelho. Sem isso, se a operadora do cliente bloquear a resolução
+    // de algum domínio específico da lista (ex.: supertv.red,
+    // sivimcdn.click), o teste de login falhava com "Servidor não
+    // encontrado" mesmo com usuário/senha corretos — apesar de o mesmo
+    // domínio funcionar normalmente em outro player ou em outra rede.
     private val clientRapido = OkHttpClient.Builder()
         .connectTimeout(10, TimeUnit.SECONDS)
         .readTimeout(15, TimeUnit.SECONDS)
         .retryOnConnectionFailure(false)
+        .dns(XtreamApi.buildSafeDns())
         .build()
 
     private val clientLento = OkHttpClient.Builder()
         .connectTimeout(25, TimeUnit.SECONDS)
         .readTimeout(25, TimeUnit.SECONDS)
         .retryOnConnectionFailure(true)
+        .dns(XtreamApi.buildSafeDns())
         .build()
 
     private val dotsHandler = Handler(Looper.getMainLooper())
