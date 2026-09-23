@@ -219,11 +219,25 @@ interface XtreamService {
 // ---------------------
 // Interceptor de headers
 // ---------------------
+// ✅ CORREÇÃO CRÍTICA (2ª causa do bug "loga mas não popula nada"): o
+// User-Agent enviado aqui era um navegador INCOMPLETO — só
+// "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36", faltando
+// "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36". Vários painéis
+// Xtream (ex.: supertv.red, sivimcdn.click) têm um bloco "if" no nginx que
+// libera só User-Agents de navegador/player completos e rejeita qualquer
+// coisa fora do padrão com "403 Access Denied" em texto puro. O login em
+// si passava (testarServidor usa outro OkHttpClient, já com UA completo),
+// mas TODA chamada de conteúdo (Home, VOD, Séries, EPG) passa por este
+// interceptor, dentro do okHttpClient usado pelo Retrofit — por isso a
+// conta logava normalmente, mas nada era baixado depois. Trocado para o
+// mesmo UA completo de Chrome já usado no login, mais Accept-Language pra
+// ficar o mais parecido possível com um navegador/player real.
 class VpnInterceptor : Interceptor {
     override fun intercept(chain: Interceptor.Chain): Response {
         val request = chain.request().newBuilder()
-            .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+            .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
             .header("Accept", "*/*")
+            .header("Accept-Language", "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7")
             .header("Cache-Control", "no-cache")
             .build()
         return chain.proceed(request)
@@ -330,6 +344,11 @@ object DnsConfig {
 
     // Client próprio e simples (sem DoH, sem failover) — só pra baixar o
     // JSON do próprio site. Timeouts curtos pra nunca atrasar o login.
+    // ✅ CORREÇÃO: User-Agent trocado pro mesmo Chrome completo usado no
+    // resto do app — mesmo sendo uma chamada pro próprio servidor (VPS),
+    // manter o padrão evita qualquer bloqueio por UA incompleto caso o
+    // domínio vltvplay.tech passe a ter regra de UA no futuro (ex.: atrás
+    // de um proxy/CDN/WAF).
     private val client: OkHttpClient by lazy {
         OkHttpClient.Builder()
             .connectTimeout(5, TimeUnit.SECONDS)
@@ -394,7 +413,7 @@ object DnsConfig {
             val request = Request.Builder()
                 .url(CONFIG_URL)
                 .header("Cache-Control", "no-cache")
-                .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
+                .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
                 .build()
 
             client.newCall(request).execute().use { response ->
