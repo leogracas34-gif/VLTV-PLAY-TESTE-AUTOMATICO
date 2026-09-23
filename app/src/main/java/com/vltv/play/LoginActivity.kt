@@ -622,7 +622,11 @@ class LoginActivity : AppCompatActivity() {
         return try {
             val request = Request.Builder()
                 .url("$urlSemBarra/player_api.php?username=$user&password=$pass")
-                .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
+                // ✅ CORREÇÃO: UA completo (com AppleWebKit/Chrome/Safari) —
+                // o UA anterior era um navegador incompleto, que o nginx de
+                // supertv.red/sivimcdn.click rejeitava com 403 "Access
+                // denied" por não bater no padrão de UA aceito.
+                .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
                 .build()
 
             httpClient.newCall(request).execute().use { response ->
