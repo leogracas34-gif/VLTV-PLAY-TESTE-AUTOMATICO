@@ -110,6 +110,25 @@ class LoginActivity : AppCompatActivity() {
 
         binding = ActivityLoginBinding.inflate(layoutInflater)
         setContentView(binding.root)
+
+        // ✅ CORREÇÃO (flash da tela de login antes de ir pro perfil):
+        // setContentView() já deixa o layout de login VISÍVEL na tela
+        // desde o primeiro frame, independente de qual branch abaixo vai
+        // rodar. Quando já existe login salvo, o fluxo cai em
+        // verificarEIniciarRapido() — que NUNCA chama setupUI() — mas como
+        // o layout de login já estava com visibility padrão (VISIBLE) por
+        // já ser o conteúdo da Activity, os campos de usuário/senha
+        // apareciam "piscando" na tela por uma fração de segundo enquanto a
+        // checagem em background (consulta ao Room, etc.) rodava, antes de
+        // navegar pra ProfilesActivity/HomeActivity. Isso dava a sensação
+        // de "flash" da tela de login. Agora o layout começa OCULTO
+        // (GONE) logo após o setContentView, e só fica visível dentro de
+        // setupUI() — que já fazia "binding.root.visibility = VISIBLE"
+        // como primeira linha. No fluxo de login já salvo, a tela fica em
+        // branco (fundo do tema) por aquele instante em vez de mostrar o
+        // formulário de login piscando.
+        binding.root.visibility = View.GONE
+
         aplicarModoImersivo()
 
         requestedOrientation = if (isTelevisionDevice()) {
