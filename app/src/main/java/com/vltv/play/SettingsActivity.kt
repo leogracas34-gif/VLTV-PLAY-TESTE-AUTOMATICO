@@ -285,8 +285,27 @@ class SettingsActivity : AppCompatActivity() {
                         val dao = database.streamDao()
                         dao.deleteAllProfiles()
                         dao.deleteAllDownloads()
+
+                        // ✅ CORREÇÃO (resquício do login antigo após "Sair"):
+                        // faltava apagar aqui o catálogo em si — vod_streams,
+                        // series_streams, watch_history e os canais ao vivo
+                        // (clearLive()). Só a LoginActivity fazia essa limpeza
+                        // (limparBancoPorTrocaDeUsuario), e mesmo lá só rodava
+                        // quando o "username" salvo era diferente do novo — só
+                        // que o próprio botão "Sair" já apaga o vltv_prefs
+                        // INTEIRO (incluindo o username) alguns passos abaixo,
+                        // então na próxima vez que alguém logasse não havia
+                        // mais username antigo pra comparar, e essa limpeza
+                        // nunca rodava. Resultado: filmes/séries do servidor
+                        // anterior continuavam no Room e apareciam como
+                        // "indisponível" depois de logar em outro servidor.
+                        // Mesma limpeza usada em limparBancoPorTrocaDeUsuario().
+                        dao.clearLive()
+                        database.openHelper.writableDatabase.execSQL("DELETE FROM vod_streams")
+                        database.openHelper.writableDatabase.execSQL("DELETE FROM series_streams")
+                        database.openHelper.writableDatabase.execSQL("DELETE FROM watch_history")
                     } catch (e: Exception) {
-                        Log.e("VLTV_SETTINGS", "Erro ao limpar perfis/downloads no logout: ${e.message}")
+                        Log.e("VLTV_SETTINGS", "Erro ao limpar perfis/downloads/catálogo no logout: ${e.message}")
                     }
 
                     withContext(Dispatchers.Main) {
@@ -1317,6 +1336,20 @@ class SettingsActivity : AppCompatActivity() {
                 val dao = database.streamDao()
                 dao.deleteAllProfiles()
                 dao.deleteAllDownloads()
+
+                // ✅ CORREÇÃO (resquício do login antigo após "Trocar
+                // Credenciais"): este fluxo nunca limpava o catálogo em si —
+                // vod_streams, series_streams, watch_history e os canais ao
+                // vivo (clearLive()) continuavam no Room com os IDs do
+                // servidor ANTERIOR, então filmes/séries antigos apareciam
+                // "indisponível" depois de logar no servidor novo. Mesma
+                // limpeza usada em limparBancoPorTrocaDeUsuario() na
+                // LoginActivity.
+                dao.clearLive()
+                database.openHelper.writableDatabase.execSQL("DELETE FROM vod_streams")
+                database.openHelper.writableDatabase.execSQL("DELETE FROM series_streams")
+                database.openHelper.writableDatabase.execSQL("DELETE FROM watch_history")
+
                 getSharedPreferences("vltv_favoritos", Context.MODE_PRIVATE).edit().clear().commit()
                 getSharedPreferences("vltv_logos_cache", Context.MODE_PRIVATE).edit().clear().commit()
                 getSharedPreferences("vltv_text_cache", Context.MODE_PRIVATE).edit().clear().commit()
@@ -1329,6 +1362,13 @@ class SettingsActivity : AppCompatActivity() {
                     .putBoolean("logout_requested", false)
                     .commit()
                 XtreamApi.salvarDns(applicationContext, novoDns)
+
+                // ✅ CORREÇÃO: este fluxo nunca disparava o recarregamento do
+                // catálogo pro novo servidor — o ContentRepository continuava
+                // com os dados (em memória) do login anterior até o app ser
+                // fechado e reaberto. Mesma chamada já usada pela LoginActivity
+                // logo após um login normal.
+                ContentRepository.recarregar(applicationContext)
 
                 // ✅ Conta trocada = sessão nova; força passar pela tela de perfil.
                 SessionManager.encerrarSessao()
