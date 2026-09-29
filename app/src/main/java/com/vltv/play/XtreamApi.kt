@@ -23,6 +23,7 @@ import java.net.InetAddress
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 
 // ---------------------
@@ -238,7 +239,6 @@ class VpnInterceptor : Interceptor {
             .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
             .header("Accept", "*/*")
             .header("Accept-Language", "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7")
-            .header("Cache-Control", "no-cache")
             .build()
         return chain.proceed(request)
     }
@@ -253,6 +253,15 @@ class VpnInterceptor : Interceptor {
 // primeiro que responder com sucesso, essa resposta é devolvida pro app
 // normalmente e esse DNS passa a ser o novo "ativo" (persistido).
 class DnsFailoverInterceptor : Interceptor {
+
+    companion object {
+        // Antes: percorria TODOS os servidores da lista (até ~20), um por
+        // um, cada um podendo gastar o timeout inteiro de conexão. Agora
+        // tenta no máximo 3 reservas, com timeout curto de conexão.
+        private const val MAX_TENTATIVAS_RESERVA = 3
+        private const val CONNECT_TIMEOUT_RESERVA_S = 8
+    }
+
     override fun intercept(chain: Interceptor.Chain): Response {
         val original = chain.request()
 
@@ -266,11 +275,14 @@ class DnsFailoverInterceptor : Interceptor {
         }
 
         val hostAtual = original.url.host
+        var tentativasReserva = 0
 
         // 2ª tentativa em diante: percorre os outros servidores da lista
         for (servidor in XtreamApi.SERVERS) {
             val servidorUrl = try { servidor.toHttpUrl() } catch (e: Exception) { continue }
             if (servidorUrl.host == hostAtual) continue
+            if (tentativasReserva >= MAX_TENTATIVAS_RESERVA) break
+            tentativasReserva++
 
             val novaUrl = original.url.newBuilder()
                 .scheme(servidorUrl.scheme)
@@ -280,7 +292,9 @@ class DnsFailoverInterceptor : Interceptor {
             val novoRequest = original.newBuilder().url(novaUrl).build()
 
             try {
-                val response = chain.proceed(novoRequest)
+                val response = chain
+                    .withConnectTimeout(CONNECT_TIMEOUT_RESERVA_S, TimeUnit.SECONDS)
+                    .proceed(novoRequest)
                 if (response.isSuccessful) {
                     // Esse DNS respondeu — vira o novo DNS ativo do app
                     XtreamApi.atualizarDnsAtivo(servidorUrl.toString() + "/")
@@ -455,7 +469,7 @@ object XtreamApi {
 
     private val okHttpClient: OkHttpClient by lazy {
         OkHttpClient.Builder()
-            .connectTimeout(30, TimeUnit.SECONDS)
+            .connectTimeout(15, TimeUnit.SECONDS)
             .readTimeout(60, TimeUnit.SECONDS)
             .writeTimeout(30, TimeUnit.SECONDS)
             .retryOnConnectionFailure(true)
@@ -472,9 +486,23 @@ object XtreamApi {
     // pela operadora em domínios específicos (ex.: supertv.red,
     // sivimcdn.click), sem duplicar a configuração do DoH em dois
     // lugares diferentes.
-    fun buildSafeDns(): Dns {
-        return try {
-            val bootstrapClient = OkHttpClient.Builder().build()
+    // ✅ Uma única instância compartilhada (XtreamApi + LoginActivity).
+    private val safeDns: Dns by lazy { criarSafeDns() }
+
+    fun buildSafeDns(): Dns = safeDns
+
+    // ✅ DoH continua sendo usado (contorna bloqueio de DNS da operadora),
+    // mas agora com CACHE em memória de 5 min por domínio. Antes cada nova
+    // conexão refazia a consulta HTTPS ao dns.google (sem cache nenhum),
+    // coisa que XCIPTV/Smart Player não fazem. O cliente de bootstrap
+    // também ganhou timeouts curtos (5s) pra uma consulta lenta não
+    // segurar a conexão por 10s.
+    private fun criarSafeDns(): Dns {
+        val doh: Dns = try {
+            val bootstrapClient = OkHttpClient.Builder()
+                .connectTimeout(5, TimeUnit.SECONDS)
+                .readTimeout(5, TimeUnit.SECONDS)
+                .build()
             DnsOverHttps.Builder()
                 .client(bootstrapClient)
                 .url("https://dns.google/dns-query".toHttpUrl())
@@ -486,7 +514,22 @@ object XtreamApi {
                 )
                 .build()
         } catch (e: Exception) {
-            Dns.SYSTEM
+            return Dns.SYSTEM
+        }
+
+        val cache = ConcurrentHashMap<String, Pair<Long, List<InetAddress>>>()
+        val ttlMs = 5 * 60 * 1000L
+
+        return object : Dns {
+            override fun lookup(hostname: String): List<InetAddress> {
+                val agora = System.currentTimeMillis()
+                val emCache = cache[hostname]
+                if (emCache != null && agora - emCache.first < ttlMs) return emCache.second
+
+                val lista = doh.lookup(hostname)
+                if (lista.isNotEmpty()) cache[hostname] = agora to lista
+                return lista
+            }
         }
     }
 
