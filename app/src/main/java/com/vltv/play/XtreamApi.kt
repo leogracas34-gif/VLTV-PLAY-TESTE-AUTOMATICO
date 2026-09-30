@@ -5,6 +5,7 @@ import com.google.gson.Gson
 import com.google.gson.reflect.TypeToken
 import okhttp3.ConnectionPool
 import okhttp3.Dns
+import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.Interceptor
 import okhttp3.OkHttpClient
@@ -252,6 +253,17 @@ class VpnInterceptor : Interceptor {
 // mesmo caminho e os mesmos parâmetros (username/password/action). No
 // primeiro que responder com sucesso, essa resposta é devolvida pro app
 // normalmente e esse DNS passa a ser o novo "ativo" (persistido).
+//
+// ✅ CORREÇÃO (logout / DNS trocado sozinho): antes, qualquer servidor
+// reserva que respondesse HTTP 200 era aceito — mesmo um painel onde o
+// usuário NÃO existe (que responde 200 com "auth":0). Resultado: se o
+// seu servidor ficasse fora do ar por alguns instantes, o app pulava pra
+// outro painel, recebia "auth":0, gravava esse painel errado como DNS
+// ativo e tratava a conta como inválida. Agora, antes de aceitar um
+// servidor reserva, o interceptor confirma com uma chamada de login que
+// o usuário/senha realmente são aceitos ali. Espelhos do mesmo painel
+// continuam funcionando normalmente como failover; painéis de outros
+// servidores são ignorados e nunca viram o DNS ativo.
 class DnsFailoverInterceptor : Interceptor {
 
     companion object {
@@ -260,6 +272,7 @@ class DnsFailoverInterceptor : Interceptor {
         // tenta no máximo 3 reservas, com timeout curto de conexão.
         private const val MAX_TENTATIVAS_RESERVA = 3
         private const val CONNECT_TIMEOUT_RESERVA_S = 8
+        private val REGEX_AUTH_ZERO = Regex("\"auth\"\\s*:\\s*\"?0\"?")
     }
 
     override fun intercept(chain: Interceptor.Chain): Response {
@@ -289,6 +302,11 @@ class DnsFailoverInterceptor : Interceptor {
                 .host(servidorUrl.host)
                 .port(servidorUrl.port)
                 .build()
+
+            // ✅ Só aceita este servidor reserva se ele reconhecer o
+            // usuário/senha. Se não reconhecer, ignora e tenta o próximo.
+            if (!usuarioAceitoNoServidor(chain, original, novaUrl)) continue
+
             val novoRequest = original.newBuilder().url(novaUrl).build()
 
             try {
@@ -296,7 +314,8 @@ class DnsFailoverInterceptor : Interceptor {
                     .withConnectTimeout(CONNECT_TIMEOUT_RESERVA_S, TimeUnit.SECONDS)
                     .proceed(novoRequest)
                 if (response.isSuccessful) {
-                    // Esse DNS respondeu — vira o novo DNS ativo do app
+                    // Esse DNS respondeu E aceita o usuário — vira o novo
+                    // DNS ativo do app
                     XtreamApi.atualizarDnsAtivo(servidorUrl.toString() + "/")
                     return response
                 }
@@ -308,6 +327,42 @@ class DnsFailoverInterceptor : Interceptor {
 
         // Nenhum DNS respondeu — deixa o erro original estourar normalmente
         return chain.proceed(original)
+    }
+
+    // Faz uma chamada de login (player_api.php sem "action") no servidor
+    // reserva e confirma que ele conhece o usuário. Devolve false se o
+    // servidor não responde, responde erro, não devolve user_info ou
+    // devolve "auth":0 (usuário inexistente naquele painel).
+    private fun usuarioAceitoNoServidor(
+        chain: Interceptor.Chain,
+        original: Request,
+        novaUrl: HttpUrl
+    ): Boolean {
+        val user = original.url.queryParameter("username")
+        val pass = original.url.queryParameter("password")
+        // Chamada sem credenciais na URL: não tem como validar, mantém
+        // o comportamento antigo.
+        if (user.isNullOrBlank() || pass.isNullOrBlank()) return true
+
+        return try {
+            val urlLogin = novaUrl.newBuilder()
+                .query(null)
+                .addQueryParameter("username", user)
+                .addQueryParameter("password", pass)
+                .build()
+            val reqLogin = original.newBuilder().url(urlLogin).build()
+
+            chain
+                .withConnectTimeout(CONNECT_TIMEOUT_RESERVA_S, TimeUnit.SECONDS)
+                .proceed(reqLogin)
+                .use { r ->
+                    if (!r.isSuccessful) return@use false
+                    val corpo = r.body?.string().orEmpty()
+                    corpo.contains("user_info") && !REGEX_AUTH_ZERO.containsMatchIn(corpo)
+                }
+        } catch (e: Exception) {
+            false
+        }
     }
 }
 
