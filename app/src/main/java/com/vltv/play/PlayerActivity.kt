@@ -104,27 +104,11 @@ class PlayerActivity : AppCompatActivity() {
     private var episodeTitles = ArrayList<String>() // título pronto ("T1E05 - Nome") de cada episódio
     private var episodeExts = ArrayList<String>()   // extensão do container de cada episódio
 
-    // Lista de Backup
-    private val serverBackupList = listOf(
-        "http://tvblack.shop",
-        "http://firewallnaousardns.xyz:80",
-        "http://fibercdn.sbs",
-        "http://topcdn.fun",
-        "http://ranos.sbs",
-        "http://cmdtv.casa",
-        "http://cmdtv.pro",
-        "http://cmdtv.sbs",
-        "http://cmdtv.top",
-        "http://starkplay.giize.com",
-        "http://starkclouddy.giize.com",
-        "http://starkplay.opik.net",
-        "http://stkplay.ooguy.com",
-        "http://stkplay.ddnsfree.com",
-        "http://starksuper.xubi.org",
-        "http://infiprotec.site",
-        "http://cntst.site",
-        "http://hostservers.top"
-    )
+    // ✅ Lista de reserva agora vem da MESMA fonte do resto do app
+    // (XtreamApi.SERVERS -> dns_config.json da VPS, com cópia salva no
+    // aparelho e FALLBACK embutido). Não existe mais lista fixa aqui.
+    private val serverBackupList: List<String>
+        get() = XtreamApi.SERVERS
 
     // Lista Ativa
     private val activeServerList = mutableListOf<String>()
@@ -223,7 +207,7 @@ class PlayerActivity : AppCompatActivity() {
             if (progress >= 0.985f) {
                 if (!countdownAtivo) {
                     countdownAtivo    = true
-                    countdownSegundos = 35
+                    countdownSegundos = 50
                     // ✅ NOVO: calcula e exibe (se for o caso) o aviso de
                     // fim de temporada assim que o countdown começa —
                     // não precisa recalcular a cada tick.
