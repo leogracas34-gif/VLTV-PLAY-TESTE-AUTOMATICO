@@ -173,22 +173,11 @@ class LiveTvActivity : AppCompatActivity() {
     private var miniDownY = 0f
     private val TAP_SLOP_DP = 14f
 
-    // Lista de failover de servidor
-    private val serverBackupList = listOf(
-        "http://fibercdn.sbs",
-        "http://ranos.sbs",
-        "http://cmdtv.casa",
-        "http://cmdtv.pro",
-        "http://cmdtv.sbs",
-        "http://cmdtv.top",
-        "http://cmdbr.life",
-        "http://zeroum.pro",
-        "http://shozcdn.site",
-        "http://edgelow.site",
-        "http://cdtune.site",
-        "http://radiodiamond.site",
-        "http://gort2.site"
-    )
+    // ✅ Lista de reserva agora vem da MESMA fonte do resto do app
+    // (XtreamApi.SERVERS -> dns_config.json da VPS, com cópia salva no
+    // aparelho e FALLBACK embutido). Não existe mais lista fixa aqui.
+    private val serverBackupList: List<String>
+        get() = XtreamApi.SERVERS
     private val activeServerList = mutableListOf<String>()
     private var serverIndex = 0
 
