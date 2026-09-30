@@ -66,6 +66,10 @@ object HomeApiClient {
     // (sem processamento do lado do backend), então tende a ser rápido.
     private const val CATALOG_TIMEOUT_MS = 25_000
 
+    // ✅ NOVO: /credits é um JSON minúsculo e roda durante a reprodução —
+    // timeout curto pra nunca segurar nada se a VPS estiver lenta.
+    private const val CREDITS_TIMEOUT_MS = 6_000
+
     data class HomeCatalogo(
         val top10FilmesRank: Map<Int, Int>,       // stream_id -> rank
         val top10SeriesRank: Map<Int, Int>,       // series_id -> rank
@@ -288,4 +292,71 @@ object HomeApiClient {
             conn?.disconnect()
         }
     }
+
+    /**
+     * ✅ NOVO: busca na VPS o ponto em que os créditos começam numa série
+     * — em SEGUNDOS RESTANTES até o fim do episódio (ex.: 72 = os
+     * créditos começam quando faltam 72s). É a mediana do que os clientes
+     * desse painel já marcaram (toque em "Próximo episódio" ou saída pelo
+     * "voltar" perto do fim). `serie` é o id do 1º episódio da série (ver
+     * PlayerActivity.serieChaveCreditos). Retorna null se ninguém ensinou
+     * ainda, se a VPS estiver fora do ar ou der qualquer erro — nesse caso
+     * o PlayerActivity usa o padrão de 50s, exatamente como antes.
+     */
+    suspend fun buscarCreditos(dns: String, serie: Int): Int? = withContext(Dispatchers.IO) {
+        var conn: HttpURLConnection? = null
+        try {
+            val urlDomain = URLEncoder.encode(dns, "UTF-8")
+            conn = (URL("$BASE_URL/credits?domain=$urlDomain&series=$serie").openConnection() as HttpURLConnection).apply {
+                requestMethod = "GET"
+                connectTimeout = CREDITS_TIMEOUT_MS
+                readTimeout = CREDITS_TIMEOUT_MS
+            }
+            if (conn.responseCode != 200) return@withContext null
+
+            val json = JSONObject(conn.inputStream.bufferedReader().use { it.readText() })
+            val segundos = json.optInt("remaining_sec", -1)
+            if (segundos > 0) segundos else null
+        } catch (e: Exception) {
+            e.printStackTrace()
+            null
+        } finally {
+            conn?.disconnect()
+        }
+    }
+
+    /**
+     * ✅ NOVO: manda pra VPS uma marcação do ponto dos créditos (segundos
+     * restantes até o fim do episódio). Silencioso: nunca lança exceção —
+     * se a VPS estiver fora do ar, só loga; o app continua normal e o
+     * valor já ficou salvo no aparelho (SharedPreferences) de qualquer jeito.
+     */
+    suspend fun enviarCreditos(dns: String, serie: Int, restanteSeg: Int): Boolean =
+        withContext(Dispatchers.IO) {
+            var conn: HttpURLConnection? = null
+            try {
+                val body = JSONObject().apply {
+                    put("domain", dns)
+                    put("series", serie)
+                    put("remaining_sec", restanteSeg)
+                }
+                conn = (URL("$BASE_URL/credits").openConnection() as HttpURLConnection).apply {
+                    requestMethod = "POST"
+                    doOutput = true
+                    connectTimeout = CREDITS_TIMEOUT_MS
+                    readTimeout = CREDITS_TIMEOUT_MS
+                    setRequestProperty("Content-Type", "application/json")
+                    setRequestProperty("x-app-key", APP_SHARED_KEY)
+                }
+                conn.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
+                val codigo = conn.responseCode
+                conn.inputStream.bufferedReader().use { it.readText() }
+                codigo in 200..299
+            } catch (e: Exception) {
+                e.printStackTrace()
+                false
+            } finally {
+                conn?.disconnect()
+            }
+        }
 }
