@@ -245,7 +245,13 @@ class PlayerActivity : AppCompatActivity() {
                 // episódio acabar (antes era um contador de 50s que nunca
                 // chegava a zero porque o episódio terminava antes).
                 countdownSegundos = restanteSeg.coerceAtLeast(0)
-                tvNextEpisodeTitle.text = "Próximo episódio em ${countdownSegundos}s"
+                // Com créditos longos o botão pode aparecer com vários
+                // minutos faltando — mostra m:ss em vez de "430s".
+                tvNextEpisodeTitle.text = if (countdownSegundos > 60) {
+                    "Próximo episódio em ${countdownSegundos / 60}:${"%02d".format(countdownSegundos % 60)}"
+                } else {
+                    "Próximo episódio em ${countdownSegundos}s"
+                }
 
                 if (nextEpisodeContainer.visibility != View.VISIBLE) {
                     nextEpisodeContainer.visibility = View.VISIBLE
@@ -318,7 +324,7 @@ class PlayerActivity : AppCompatActivity() {
     //    instante em que o botão aparece está só reagindo a ele, não
     //    mostrando onde os créditos começam — e aprender isso faria o
     //    botão aparecer 10s mais cedo a cada episódio.
-    //  - sair pelo "voltar" perto do fim (20 a 120s restantes).
+    //  - sair pelo "voltar" na reta final (75%+ assistido, 20s a 10min restantes).
     // NÃO aprende com home/tela apagada/PiP (onStop), nem quando o próximo
     // episódio abre sozinho (o cliente não escolheu nada).
     private fun aprenderPontoCreditos(toqueNoBotao: Boolean) {
@@ -334,8 +340,14 @@ class PlayerActivity : AppCompatActivity() {
             val esperou = botaoVisivelDesdeMs != 0L &&
                 SystemClock.elapsedRealtime() - botaoVisivelDesdeMs >= 6_000L
             if (!esperou) return
-        } else if (restanteSeg !in 20..120) {
-            return
+        } else {
+            // Saída pelo "voltar": só conta se já estava na reta final do
+            // episódio (75% ou mais assistido) e dentro da faixa aceita.
+            // A trava dos 75% evita aprender com quem desistiu no meio do
+            // episódio — sem ela, fechar aos 20min de um episódio de 1h
+            // marcaria "40 min restantes" como ponto dos créditos.
+            val progresso = pos.toFloat() / dur.toFloat()
+            if (restanteSeg !in 20..CREDITOS_MAX_SEG || progresso < 0.75f) return
         }
         if (restanteSeg !in CREDITOS_MIN_SEG..CREDITOS_MAX_SEG) return
 
@@ -1644,8 +1656,9 @@ class PlayerActivity : AppCompatActivity() {
         // Quantos segundos ANTES do ponto aprendido o botão aparece.
         private const val ANTECEDENCIA_SEG = 10
 
-        // Faixa aceita pro ponto dos créditos (mesma validação do backend).
+        // Faixa aceita pro ponto dos créditos (mesma validação do backend:
+        // 10s a 10min — há séries com créditos bem longos).
         private const val CREDITOS_MIN_SEG = 10
-        private const val CREDITOS_MAX_SEG = 180
+        private const val CREDITOS_MAX_SEG = 600
     }
 }
