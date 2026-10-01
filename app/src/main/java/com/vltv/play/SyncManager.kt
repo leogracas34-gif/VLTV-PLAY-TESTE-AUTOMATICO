@@ -18,7 +18,11 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
-import java.net.URL
+import okhttp3.HttpUrl.Companion.toHttpUrl
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import java.io.IOException
+import java.util.concurrent.TimeUnit
 
 /**
  * SyncManager — controla a sincronização de conteúdo com o servidor Xtream.
@@ -388,7 +392,16 @@ object SyncManager {
 
             var aplicadoPeloBackend = false
             try {
-                if (catalogoBackend == null && !jaEnviouCatalogoAntes) {
+                // ✅ CORRIGIDO: se o upload falhou há pouco tempo, NÃO tenta
+                // de novo em toda abertura do app (cada tentativa podia
+                // segurar a Home por até 40s antes do buscarHome). Só
+                // volta a tentar depois de 6 horas.
+                val chaveUltimaTentativa = "ultima_tentativa_envio_" + dns.hashCode()
+                val ultimaTentativa = prefsBackend.getLong(chaveUltimaTentativa, 0L)
+                val podeTentarEnvio = System.currentTimeMillis() - ultimaTentativa > 6 * 60 * 60 * 1000L
+
+                if (catalogoBackend == null && !jaEnviouCatalogoAntes && podeTentarEnvio) {
+                    prefsBackend.edit().putLong(chaveUltimaTentativa, System.currentTimeMillis()).apply()
                     // ✅ CORRIGIDO: só marca "já enviei" se o backend realmente
                     // recebeu (enviarCatalogo devolve false em timeout/erro).
                     // Antes marcava sempre — um upload que falhava uma vez
@@ -460,9 +473,46 @@ object SyncManager {
     }
 
     // ── Busca crua no Xtream (usada só quando o backend não tem o catálogo) ──
+    //
+    // ✅ CORRIGIDO (Home/abas demorando muito pra popular): antes isso era
+    // `URL(url).readText()` — conexão "crua" do Java que (1) NÃO tem
+    // timeout (se o painel ficar lento ou travar, esperava pra sempre),
+    // (2) NÃO usa o DNS-over-HTTPS do app, (3) NÃO tem o failover
+    // automático de DNS (se o DNS salvo caísse, não tentava outro) e
+    // (4) manda o User-Agent padrão do Android ("Dalvik/..."), que vários
+    // painéis Xtream rejeitam com 403 (o mesmo problema já corrigido no
+    // resto do app). Agora usa um cliente OkHttp com timeouts, DoH,
+    // User-Agent de navegador e o mesmo DnsFailoverInterceptor das
+    // demais chamadas Xtream.
+    private val clienteXtream: OkHttpClient by lazy {
+        OkHttpClient.Builder()
+            .connectTimeout(15, TimeUnit.SECONDS)
+            .readTimeout(60, TimeUnit.SECONDS)
+            .writeTimeout(30, TimeUnit.SECONDS)
+            .callTimeout(120, TimeUnit.SECONDS)
+            .retryOnConnectionFailure(true)
+            .dns(XtreamApi.buildSafeDns())
+            .addInterceptor(VpnInterceptor())
+            .addInterceptor(DnsFailoverInterceptor())
+            .build()
+    }
+
+    private fun baixarJsonXtream(dns: String, user: String, pass: String, action: String): String {
+        val base = dns.trim().removeSuffix("/")
+        val url = "$base/player_api.php".toHttpUrl().newBuilder()
+            .addQueryParameter("username", user)
+            .addQueryParameter("password", pass)
+            .addQueryParameter("action", action)
+            .build()
+        val request = Request.Builder().url(url).build()
+        clienteXtream.newCall(request).execute().use { response ->
+            if (!response.isSuccessful) throw IOException("HTTP ${response.code} em $action")
+            return response.body?.string().orEmpty()
+        }
+    }
+
     private fun buscarArrayXtream(dns: String, user: String, pass: String, action: String): JSONArray {
-        val url = "$dns/player_api.php?username=$user&password=$pass&action=$action"
-        return JSONArray(URL(url).readText())
+        return JSONArray(baixarJsonXtream(dns, user, pass, action))
     }
 
     // ✅ NOVO — helpers de leitura "JSON tem prioridade, existente é
@@ -614,8 +664,7 @@ object SyncManager {
     // ── LIVE ───────────────────────────────────────────────────────────────
     // Continua vindo sempre do Xtream — o backend não guarda canais ao vivo.
     private suspend fun sincronizarLive(db: AppDatabase, dns: String, user: String, pass: String) = withContext(Dispatchers.IO) {
-        val liveUrl = "$dns/player_api.php?username=$user&password=$pass&action=get_live_streams"
-        val liveArray = JSONArray(URL(liveUrl).readText())
+        val liveArray = buscarArrayXtream(dns, user, pass, "get_live_streams")
         val liveBatch = mutableListOf<LiveStreamEntity>()
         for (i in 0 until liveArray.length()) {
             val obj = liveArray.getJSONObject(i)
