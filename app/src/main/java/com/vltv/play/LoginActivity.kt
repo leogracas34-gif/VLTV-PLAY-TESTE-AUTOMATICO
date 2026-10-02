@@ -519,6 +519,7 @@ class LoginActivity : AppCompatActivity() {
         lifecycleScope.launch(Dispatchers.IO) {
             contaExpiradaDetectada = false
             contaExpiradaEhTeste = false
+            diagnostico.clear()
 
             // ✅ NOVO: garante a lista de DNS mais recente da VPS antes de
             // testar os servidores (não baixa de novo se já baixou há
@@ -609,7 +610,7 @@ class LoginActivity : AppCompatActivity() {
                     if (expirada) {
                         abrirTelaExpirado(ehTeste)
                     } else {
-                        mostrarErro("Servidor não encontrado. Verifique login e senha.")
+                        mostrarFalhaComDiagnostico()
                     }
                 }
             }
@@ -652,62 +653,94 @@ class LoginActivity : AppCompatActivity() {
         return vencedor
     }
 
+    // ✅ NOVO: resultado do teste de cada DNS (host -> causa), pra mostrar
+    // na tela quando o login falha em todos. "login recusado" = o painel
+    // respondeu normalmente, só que o usuário não é daquele painel.
+    private val diagnostico = java.util.concurrent.ConcurrentHashMap<String, String>()
+
+    private fun causaDaExcecao(e: Exception): String = when (e) {
+        is java.net.UnknownHostException -> "DNS não resolveu"
+        is java.net.SocketTimeoutException -> "tempo esgotado"
+        is java.net.ConnectException -> "conexão recusada"
+        is javax.net.ssl.SSLException -> "erro SSL/HTTPS"
+        else -> e.javaClass.simpleName
+    }
+
     private fun testarServidor(baseUrl: String, user: String, pass: String, httpClient: OkHttpClient): String? {
         val urlBase = normalizarBaseUrl(baseUrl)
         val urlSemBarra = urlBase.removeSuffix("/")
-        return try {
-            val request = Request.Builder()
-                .url("$urlSemBarra/player_api.php?username=$user&password=$pass")
-                // ✅ CORREÇÃO: UA completo (com AppleWebKit/Chrome/Safari) —
-                // o UA anterior era um navegador incompleto, que o nginx de
-                // supertv.red/sivimcdn.click rejeitava com 403 "Access
-                // denied" por não bater no padrão de UA aceito.
-                .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
-                .header("Accept-Language", "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7")
-                .build()
+        val host = try { java.net.URI(urlSemBarra).host ?: urlSemBarra } catch (e: Exception) { urlSemBarra }
 
-            httpClient.newCall(request).execute().use { response ->
-                if (response.isSuccessful) {
-                    val body = response.body?.string() ?: ""
+        // ✅ NOVO: tenta o User-Agent preferido desse painel (Chrome por
+        // padrão) e, se o painel responder 403/406, tenta o outro (UA de
+        // player). O que funcionar fica gravado pra esse domínio.
+        val uas = UaHelper.ordemParaHost(host)
+        var ultimoCodigo = -1
 
-                    // ✅ NOVO: registra quando o servidor responde que a
-                    // conta existe (auth diferente de 0) mas está
-                    // Expired/Disabled. A conta continua sendo rejeitada
-                    // abaixo (retorna null), mas quem chamou agora sabe
-                    // que o motivo foi expiração e pode avisar o usuário.
-                    val temUserInfo = body.contains("user_info") && body.contains("server_info")
-                    val authZero = Regex("\"auth\"\\s*:\\s*\"?0\"?").containsMatchIn(body)
-                    val bloqueadaNoServidor = Regex(
-                        "\"status\"\\s*:\\s*\"(Expired|Disabled)\"",
-                        RegexOption.IGNORE_CASE
-                    ).containsMatchIn(body)
-                    if (temUserInfo && !authZero && bloqueadaNoServidor) {
-                        contaExpiradaEhTeste = Regex(
-                            "\"is_trial\"\\s*:\\s*\"?(1|true)\"?",
+        for (ua in uas) {
+            val resultado: String? = try {
+                val request = Request.Builder()
+                    .url("$urlSemBarra/player_api.php?username=$user&password=$pass")
+                    .header("User-Agent", ua)
+                    .header("Accept-Language", "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7")
+                    .build()
+
+                httpClient.newCall(request).execute().use { response ->
+                    ultimoCodigo = response.code
+                    if (response.isSuccessful) {
+                        val body = response.body?.string() ?: ""
+
+                        // Registra quando o servidor responde que a conta
+                        // existe (auth diferente de 0) mas está
+                        // Expired/Disabled — pra avisar o usuário.
+                        val temUserInfo = body.contains("user_info") && body.contains("server_info")
+                        val authZero = Regex("\"auth\"\\s*:\\s*\"?0\"?").containsMatchIn(body)
+                        val bloqueadaNoServidor = Regex(
+                            "\"status\"\\s*:\\s*\"(Expired|Disabled)\"",
                             RegexOption.IGNORE_CASE
                         ).containsMatchIn(body)
-                        contaExpiradaDetectada = true
-                    }
+                        if (temUserInfo && !authZero && bloqueadaNoServidor) {
+                            contaExpiradaEhTeste = Regex(
+                                "\"is_trial\"\\s*:\\s*\"?(1|true)\"?",
+                                RegexOption.IGNORE_CASE
+                            ).containsMatchIn(body)
+                            contaExpiradaDetectada = true
+                        }
 
-                    val valido = body.contains("user_info") &&
-                            body.contains("server_info") &&
-                            !body.contains("\"auth\":0") &&
-                            !body.contains("\"auth\": 0") &&
-                            !body.contains("\"auth\":\"0\"") &&
-                            !body.contains("\"status\":\"Disabled\"") &&
-                            !body.contains("\"status\":\"Expired\"")
-                    if (valido) {
-                        urlBase
+                        val valido = body.contains("user_info") &&
+                                body.contains("server_info") &&
+                                !body.contains("\"auth\":0") &&
+                                !body.contains("\"auth\": 0") &&
+                                !body.contains("\"auth\":\"0\"") &&
+                                !body.contains("\"status\":\"Disabled\"") &&
+                                !body.contains("\"status\":\"Expired\"")
+                        if (valido) urlBase else null
                     } else {
                         null
                     }
-                } else {
-                    null
                 }
+            } catch (e: Exception) {
+                // Erro de rede (DNS, timeout, conexão): trocar o UA não
+                // adianta — registra a causa e desiste desse DNS.
+                diagnostico[host] = causaDaExcecao(e)
+                return null
             }
-        } catch (e: Exception) {
-            null
+
+            if (resultado != null) {
+                UaHelper.lembrar(host, ua)
+                diagnostico[host] = "ok"
+                return resultado
+            }
+            // 403/406 = provável bloqueio de User-Agent → tenta o próximo UA
+            if (ultimoCodigo == 403 || ultimoCodigo == 406) continue
+
+            diagnostico[host] =
+                if (ultimoCodigo in 200..299) "login recusado" else "HTTP $ultimoCodigo"
+            return null
         }
+
+        diagnostico[host] = "HTTP $ultimoCodigo (acesso negado)"
+        return null
     }
 
     private suspend fun preCarregarLoteMinimo(dns: String, user: String, pass: String) {
@@ -832,7 +865,7 @@ class LoginActivity : AppCompatActivity() {
                 connectTimeout = 10_000
                 readTimeout    = 12_000
                 requestMethod  = "GET"
-                setRequestProperty("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
+                setRequestProperty("User-Agent", UaHelper.paraHost(try { java.net.URL(url).host } catch (e: Exception) { "" }))
                 setRequestProperty("Accept", "application/json")
                 setRequestProperty("Accept-Language", "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7")
             }
@@ -938,6 +971,30 @@ class LoginActivity : AppCompatActivity() {
         intent.flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK
         startActivity(intent)
         finish()
+    }
+
+    // ✅ NOVO: em vez de só "Servidor não encontrado", mostra por que cada
+    // DNS falhou (DNS não resolveu, tempo esgotado, HTTP 403...). Painéis
+    // que só responderam "login recusado" não entram na lista — isso é
+    // normal (o usuário não pertence àquele painel).
+    private fun mostrarFalhaComDiagnostico() {
+        val problemas = diagnostico.entries
+            .filter { it.value != "login recusado" && it.value != "ok" }
+            .sortedBy { it.key }
+        val texto = StringBuilder("Servidor não encontrado. Verifique login e senha.")
+        if (problemas.isNotEmpty()) {
+            texto.append("\n\nProblemas de conexão:")
+            problemas.forEach { texto.append("\n• ${it.key}: ${it.value}") }
+        }
+        try {
+            androidx.appcompat.app.AlertDialog.Builder(this)
+                .setTitle("Não foi possível entrar")
+                .setMessage(texto.toString())
+                .setPositiveButton("OK", null)
+                .show()
+        } catch (e: Exception) {
+            mostrarErro("Servidor não encontrado. Verifique login e senha.")
+        }
     }
 
     private fun mostrarErro(msg: String) {
