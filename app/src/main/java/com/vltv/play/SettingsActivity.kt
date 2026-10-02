@@ -1312,23 +1312,39 @@ class SettingsActivity : AppCompatActivity() {
     private fun testarServidor(baseUrl: String, user: String, pass: String, httpClient: OkHttpClient): String? {
         val urlBase     = normalizarBaseUrl(baseUrl)
         val urlSemBarra = urlBase.removeSuffix("/")
-        return try {
-            val request = Request.Builder()
-                .url("$urlSemBarra/player_api.php?username=$user&password=$pass")
-                .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
-                .header("Accept-Language", "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7")
-                .build()
-            httpClient.newCall(request).execute().use { response ->
-                if (response.isSuccessful) {
-                    val body = response.body?.string() ?: ""
-                    val valido = body.contains("user_info") &&
-                            body.contains("server_info") &&
-                            !body.contains("\"auth\":0") &&
-                            !body.contains("\"auth\": 0")
-                    if (valido) urlBase else null
-                } else null
+        val host = try { java.net.URI(urlSemBarra).host ?: urlSemBarra } catch (e: Exception) { urlSemBarra }
+
+        // ✅ NOVO: mesmo esquema da LoginActivity — tenta o User-Agent
+        // preferido do painel e, se vier 403/406, tenta o outro.
+        for (ua in UaHelper.ordemParaHost(host)) {
+            var codigo = -1
+            val resultado: String? = try {
+                val request = Request.Builder()
+                    .url("$urlSemBarra/player_api.php?username=$user&password=$pass")
+                    .header("User-Agent", ua)
+                    .header("Accept-Language", "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7")
+                    .build()
+                httpClient.newCall(request).execute().use { response ->
+                    codigo = response.code
+                    if (response.isSuccessful) {
+                        val body = response.body?.string() ?: ""
+                        val valido = body.contains("user_info") &&
+                                body.contains("server_info") &&
+                                !body.contains("\"auth\":0") &&
+                                !body.contains("\"auth\": 0")
+                        if (valido) urlBase else null
+                    } else null
+                }
+            } catch (e: Exception) { return null }
+
+            if (resultado != null) {
+                UaHelper.lembrar(host, ua)
+                return resultado
             }
-        } catch (e: Exception) { null }
+            if (codigo == 403 || codigo == 406) continue
+            return null
+        }
+        return null
     }
 
     private fun normalizarBaseUrl(dns: String): String {
