@@ -234,14 +234,83 @@ interface XtreamService {
 // conta logava normalmente, mas nada era baixado depois. Trocado para o
 // mesmo UA completo de Chrome já usado no login, mais Accept-Language pra
 // ficar o mais parecido possível com um navegador/player real.
+// ✅ NOVO: UaHelper — cada painel Xtream tem a sua regra de User-Agent
+// (uns só aceitam navegador completo, outros só aceitam UA de player
+// IPTV). Em vez de fixar um UA pra todos, o app tenta o padrão (Chrome) e,
+// se o painel responder 403/406, tenta o UA de player; o que funcionar
+// fica gravado POR DOMÍNIO (e persiste entre aberturas do app).
+object UaHelper {
+    const val CHROME = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+    const val PLAYER = "IPTVSmartersPro"
+
+    private const val PREFS = "vltv_ua_host"
+    private val preferido = ConcurrentHashMap<String, String>()
+    @Volatile private var carregado = false
+
+    private fun ctx(): Context? = try {
+        Class.forName("android.app.ActivityThread")
+            .getMethod("currentApplication").invoke(null) as? Context
+    } catch (e: Exception) { null }
+
+    private fun carregar() {
+        if (carregado) return
+        val c = ctx() ?: return
+        try {
+            c.getSharedPreferences(PREFS, Context.MODE_PRIVATE).all.forEach { (k, v) ->
+                if (v is String) preferido[k] = v
+            }
+        } catch (e: Exception) { }
+        carregado = true
+    }
+
+    fun paraHost(host: String): String {
+        carregar()
+        return preferido[host.lowercase()] ?: CHROME
+    }
+
+    // UA preferido primeiro, depois os outros.
+    fun ordemParaHost(host: String): List<String> {
+        val p = paraHost(host)
+        return listOf(p) + listOf(CHROME, PLAYER).filter { it != p }
+    }
+
+    fun lembrar(host: String, ua: String) {
+        val h = host.lowercase()
+        if (preferido[h] == ua) return
+        preferido[h] = ua
+        try {
+            ctx()?.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                ?.edit()?.putString(h, ua)?.apply()
+        } catch (e: Exception) { }
+    }
+}
+
 class VpnInterceptor : Interceptor {
-    override fun intercept(chain: Interceptor.Chain): Response {
-        val request = chain.request().newBuilder()
-            .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
+    private fun montar(original: Request, ua: String): Request =
+        original.newBuilder()
+            .header("User-Agent", ua)
             .header("Accept", "*/*")
             .header("Accept-Language", "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7")
             .build()
-        return chain.proceed(request)
+
+    override fun intercept(chain: Interceptor.Chain): Response {
+        val original = chain.request()
+        val host = original.url.host
+        val uas = UaHelper.ordemParaHost(host)
+
+        var resp = chain.proceed(montar(original, uas[0]))
+        if (resp.code != 403 && resp.code != 406) return resp
+
+        // Painel recusou esse UA — tenta os outros antes de desistir.
+        for (alt in uas.drop(1)) {
+            resp.close()
+            resp = chain.proceed(montar(original, alt))
+            if (resp.code != 403 && resp.code != 406) {
+                UaHelper.lembrar(host, alt)
+                return resp
+            }
+        }
+        return resp
     }
 }
 
@@ -662,6 +731,14 @@ object XtreamApi {
     // coisa que XCIPTV/Smart Player não fazem. O cliente de bootstrap
     // também ganhou timeouts curtos (5s) pra uma consulta lenta não
     // segurar a conexão por 10s.
+    // ✅ NOVO: coloca os endereços IPv4 antes dos IPv6. Em muitos Wi-Fi o
+    // IPv6 "aparece" mas não tem saída pra internet; se o IPv6 vem
+    // primeiro, cada conexão fica esperando o timeout inteiro nele antes
+    // de tentar o IPv4 (login lento ou que nunca entra no Wi-Fi, mas normal
+    // no 4G). Os IPv6 continuam na lista como reserva.
+    private fun ipv4Primeiro(lista: List<InetAddress>): List<InetAddress> =
+        lista.sortedBy { if (it is java.net.Inet4Address) 0 else 1 }
+
     private fun criarSafeDns(): Dns {
         val doh: Dns = try {
             val bootstrapClient = OkHttpClient.Builder()
@@ -709,7 +786,7 @@ object XtreamApi {
                 }
 
                 val doSistema: List<InetAddress> = try {
-                    Dns.SYSTEM.lookup(hostname)
+                    ipv4Primeiro(Dns.SYSTEM.lookup(hostname))
                 } catch (e: Exception) {
                     emptyList()
                 }
@@ -720,7 +797,7 @@ object XtreamApi {
                 }
 
                 val doDoh: List<InetAddress> = try {
-                    doh.lookup(hostname)
+                    ipv4Primeiro(doh.lookup(hostname))
                 } catch (e: Exception) {
                     emptyList()
                 }
