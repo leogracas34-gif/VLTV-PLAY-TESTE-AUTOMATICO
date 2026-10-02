@@ -32,6 +32,8 @@ import com.vltv.play.data.ProfileEntity
 import com.vltv.play.ui.AvatarSelectionDialog
 import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import retrofit2.Call
@@ -125,16 +127,20 @@ class SettingsActivity : AppCompatActivity() {
     private val SERVERS: List<String>
         get() = XtreamApi.SERVERS
 
+    // ✅ CORREÇÃO: agora usa o mesmo resolvedor de DNS da LoginActivity
+    // (DNS do sistema primeiro, DoH só se o sistema falhar).
     private val clientRapido = OkHttpClient.Builder()
         .connectTimeout(10, TimeUnit.SECONDS)
         .readTimeout(15, TimeUnit.SECONDS)
         .retryOnConnectionFailure(false)
+        .dns(XtreamApi.buildSafeDns())
         .build()
 
     private val clientLento = OkHttpClient.Builder()
         .connectTimeout(25, TimeUnit.SECONDS)
         .readTimeout(25, TimeUnit.SECONDS)
         .retryOnConnectionFailure(true)
+        .dns(XtreamApi.buildSafeDns())
         .build()
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -1219,16 +1225,16 @@ class SettingsActivity : AppCompatActivity() {
 
             var dnsVencedor: String? = null
             try {
-                val canal = Channel<String>(Channel.UNLIMITED)
-                val jobs = SERVERS.map { url ->
-                    launch(Dispatchers.IO) {
-                        val r = testarServidor(url, novoUsuario, novaSenha, clientRapido)
-                        if (r != null) canal.trySend(r)
-                    }
+                // ✅ CORREÇÃO: mesmo esquema da LoginActivity — 1ª rodada
+                // com 1 DNS por painel (lâmina), 2ª rodada com os irmãos.
+                dnsVencedor = testarGrupoEmParalelo(
+                    DnsConfig.primeiraRodada(), novoUsuario, novaSenha, 9, 15_000L
+                )
+                if (dnsVencedor == null) {
+                    dnsVencedor = testarGrupoEmParalelo(
+                        DnsConfig.segundaRodada(), novoUsuario, novaSenha, 6, 15_000L
+                    )
                 }
-                dnsVencedor = withTimeoutOrNull(18_000L) { canal.receive() }
-                jobs.forEach { it.cancel() }
-                canal.close()
             } catch (e: Exception) {
                 Log.e("VLTV_SETTINGS", "Fase paralela erro: ${e.message}")
             }
@@ -1238,7 +1244,9 @@ class SettingsActivity : AppCompatActivity() {
                     tvStatus.text    = "Tentando servidores alternativos..."
                     tvSubStatus.text = "Aguarde um momento"
                 }
+                val fimFallback = System.currentTimeMillis() + 30_000L
                 for (servidor in SERVERS) {
+                    if (System.currentTimeMillis() > fimFallback) break
                     val r = testarServidor(servidor, novoUsuario, novaSenha, clientLento)
                     if (r != null) { dnsVencedor = r; break }
                 }
@@ -1268,6 +1276,39 @@ class SettingsActivity : AppCompatActivity() {
     // Denied" e caía direto em "Servidor não encontrado", mesmo com
     // usuário/senha corretos. Trocado pro mesmo UA completo de Chrome
     // usado em todo o resto do app, mais Accept-Language.
+    // ✅ NOVO: testa uma lista de DNS em paralelo (no máximo
+    // maxSimultaneos ao mesmo tempo). Devolve o primeiro que responder
+    // com login válido, ou null. Sai assim que todos terminam.
+    private suspend fun CoroutineScope.testarGrupoEmParalelo(
+        lista: List<String>, user: String, pass: String,
+        maxSimultaneos: Int, tetoMs: Long
+    ): String? {
+        if (lista.isEmpty()) return null
+        val canal = Channel<String>(Channel.UNLIMITED)
+        val limite = Semaphore(maxSimultaneos)
+        val jobs = lista.map { url ->
+            launch(Dispatchers.IO) {
+                limite.withPermit {
+                    val r = testarServidor(url, user, pass, clientRapido)
+                    if (r != null) canal.trySend(r)
+                }
+            }
+        }
+        var vencedor: String? = null
+        val inicio = System.currentTimeMillis()
+        while (System.currentTimeMillis() - inicio < tetoMs) {
+            val recebido = withTimeoutOrNull(300L) { canal.receive() }
+            if (recebido != null) { vencedor = recebido; break }
+            if (jobs.all { it.isCompleted }) {
+                vencedor = canal.tryReceive().getOrNull()
+                break
+            }
+        }
+        jobs.forEach { it.cancel() }
+        canal.close()
+        return vencedor
+    }
+
     private fun testarServidor(baseUrl: String, user: String, pass: String, httpClient: OkHttpClient): String? {
         val urlBase     = normalizarBaseUrl(baseUrl)
         val urlSemBarra = urlBase.removeSuffix("/")
