@@ -58,7 +58,14 @@ object HomeApiClient {
     // O upload demora mais porque o backend PROCESSA o TMDB inteiro
     // (Top10/Novidades/Temporadas) antes de responder — dê uma folga.
     private const val UPLOAD_TIMEOUT_MS = 40_000
-    private const val HOME_TIMEOUT_MS = 15_000
+    private const val HOME_TIMEOUT_MS = 10_000
+
+    // ✅ CORREÇÃO (Home lenta/incompleta no Wi-Fi): o backend é acessado
+    // por IP:porta (3344), e alguns Wi-Fi bloqueiam essa porta — a
+    // conexão ficava pendurada até 15-40s antes de o app desistir e usar
+    // o cálculo local. Agora a conexão desiste em 4s (leitura mantém o
+    // tempo longo, pois o payload é grande).
+    private const val CONNECT_TIMEOUT_MS = 4_000
 
     // O catálogo inteiro (17 mil+ filmes, 8 mil+ séries em painéis
     // grandes) é um payload bem maior que o /home — dá mais folga de
@@ -155,7 +162,7 @@ object HomeApiClient {
                 conn = (URL("$BASE_URL/catalog/upload").openConnection() as HttpURLConnection).apply {
                     requestMethod = "POST"
                     doOutput = true
-                    connectTimeout = UPLOAD_TIMEOUT_MS
+                    connectTimeout = CONNECT_TIMEOUT_MS
                     readTimeout = UPLOAD_TIMEOUT_MS
                     setRequestProperty("Content-Type", "application/json")
                     setRequestProperty("x-app-key", APP_SHARED_KEY)
@@ -195,7 +202,7 @@ object HomeApiClient {
             val urlDomain = URLEncoder.encode(dns, "UTF-8")
             conn = (URL("$BASE_URL/catalog?domain=$urlDomain").openConnection() as HttpURLConnection).apply {
                 requestMethod = "GET"
-                connectTimeout = CATALOG_TIMEOUT_MS
+                connectTimeout = CONNECT_TIMEOUT_MS
                 readTimeout = CATALOG_TIMEOUT_MS
             }
             if (conn.responseCode != 200) return@withContext null
@@ -232,7 +239,7 @@ object HomeApiClient {
             val urlDomain = URLEncoder.encode(dns, "UTF-8")
             conn = (URL("$BASE_URL/home?domain=$urlDomain").openConnection() as HttpURLConnection).apply {
                 requestMethod = "GET"
-                connectTimeout = HOME_TIMEOUT_MS
+                connectTimeout = CONNECT_TIMEOUT_MS
                 readTimeout = HOME_TIMEOUT_MS
             }
             if (conn.responseCode != 200) return@withContext null
