@@ -33,6 +33,8 @@ import com.vltv.play.data.VodEntity
 import com.vltv.play.databinding.ActivityLoginBinding
 import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import org.json.JSONArray
@@ -526,24 +528,19 @@ class LoginActivity : AppCompatActivity() {
             var dnsVencedor: String? = null
 
             try {
-                val canal = Channel<String>(Channel.UNLIMITED)
-                val jobs = SERVERS.map { url ->
-                    launch(Dispatchers.IO) {
-                        val r = testarServidor(url, user, pass, clientRapido)
-                        if (r != null) canal.trySend(r)
-                    }
+                // ✅ CORREÇÃO: em vez de testar TODOS os DNS de uma vez,
+                // testa em 2 rodadas. 1ª: só 1 DNS de cada painel
+                // (lâmina), todos em paralelo — rápido e sem estourar o
+                // limite dos painéis (429/403). 2ª (só se a 1ª não achou
+                // ninguém): os DNS irmãos, no máx. 6 ao mesmo tempo.
+                dnsVencedor = testarGrupoEmParalelo(
+                    DnsConfig.primeiraRodada(), user, pass, 9, 15_000L
+                )
+                if (dnsVencedor == null && !contaExpiradaDetectada) {
+                    dnsVencedor = testarGrupoEmParalelo(
+                        DnsConfig.segundaRodada(), user, pass, 6, 15_000L
+                    )
                 }
-                // ✅ CORREÇÃO: polling em fatias de 300ms em vez de esperar
-                // o teto de 18s inteiro, saindo assim que a expiração é
-                // confirmada.
-                val inicioEspera = System.currentTimeMillis()
-                while (System.currentTimeMillis() - inicioEspera < 18_000L) {
-                    val recebido = withTimeoutOrNull(300L) { canal.receive() }
-                    if (recebido != null) { dnsVencedor = recebido; break }
-                    if (contaExpiradaDetectada) break
-                }
-                jobs.forEach { it.cancel() }
-                canal.close()
             } catch (e: Exception) {
                 e.printStackTrace()
             }
@@ -556,7 +553,11 @@ class LoginActivity : AppCompatActivity() {
             // ✅ Se algum servidor já confirmou que a conta expirou, pula
             // o fallback — não adianta insistir.
             if (dnsVencedor == null && !contaExpiradaDetectada) {
+                // ✅ CORREÇÃO: teto de 30s no total. Antes eram até ~24
+                // servidores em fila, cada um podendo gastar 25s+25s.
+                val fimFallback = System.currentTimeMillis() + 30_000L
                 for (servidor in SERVERS) {
+                    if (System.currentTimeMillis() > fimFallback) break
                     // ✅ CORREÇÃO: sai do loop assim que a expiração é
                     // confirmada, em vez de continuar testando os servidores
                     // restantes à toa.
@@ -613,6 +614,42 @@ class LoginActivity : AppCompatActivity() {
                 }
             }
         }
+    }
+
+    // ✅ NOVO: testa uma lista de DNS em paralelo (no máximo
+    // maxSimultaneos ao mesmo tempo). Devolve o primeiro que responder
+    // com login válido, ou null se ninguém respondeu, se a conta foi
+    // detectada como expirada, ou se estourou o teto de tempo. Sai assim
+    // que todos terminam (não espera o teto à toa).
+    private suspend fun CoroutineScope.testarGrupoEmParalelo(
+        lista: List<String>, user: String, pass: String,
+        maxSimultaneos: Int, tetoMs: Long
+    ): String? {
+        if (lista.isEmpty()) return null
+        val canal = Channel<String>(Channel.UNLIMITED)
+        val limite = Semaphore(maxSimultaneos)
+        val jobs = lista.map { url ->
+            launch(Dispatchers.IO) {
+                limite.withPermit {
+                    val r = testarServidor(url, user, pass, clientRapido)
+                    if (r != null) canal.trySend(r)
+                }
+            }
+        }
+        var vencedor: String? = null
+        val inicio = System.currentTimeMillis()
+        while (System.currentTimeMillis() - inicio < tetoMs) {
+            val recebido = withTimeoutOrNull(300L) { canal.receive() }
+            if (recebido != null) { vencedor = recebido; break }
+            if (contaExpiradaDetectada) break
+            if (jobs.all { it.isCompleted }) {
+                vencedor = canal.tryReceive().getOrNull()
+                break
+            }
+        }
+        jobs.forEach { it.cancel() }
+        canal.close()
+        return vencedor
     }
 
     private fun testarServidor(baseUrl: String, user: String, pass: String, httpClient: OkHttpClient): String? {
