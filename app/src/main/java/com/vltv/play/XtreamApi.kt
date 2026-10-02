@@ -534,6 +534,31 @@ object DnsConfig {
         return lamina.filter { hostDe(it) != alvo }
     }
 
+    // ✅ NOVO: 1ª rodada do teste de login — só o PRIMEIRO DNS de cada
+    // lâmina (cada lâmina = um painel), mais qualquer DNS da lista que
+    // não esteja em nenhuma lâmina. Em vez de testar todos os DNS de uma
+    // vez, testa só 1 por painel (poucos pedidos simultâneos). Se o
+    // arquivo não tem lâminas, devolve a lista inteira (comportamento
+    // antigo).
+    fun primeiraRodada(): List<String> {
+        val todos = servers()
+        val lams = laminas
+        if (lams.isNullOrEmpty()) return todos
+        val primeiros = lams.map { it.first() }
+        val dentroDeLamina = lams.flatten().toSet()
+        val soltos = todos.filter { it !in dentroDeLamina }
+        return (primeiros + soltos).distinct()
+    }
+
+    // ✅ NOVO: 2ª rodada — os DNS "irmãos" que ficaram de fora da 1ª.
+    // Só roda se ninguém respondeu na 1ª rodada.
+    fun segundaRodada(): List<String> {
+        servers()
+        val lams = laminas
+        if (lams.isNullOrEmpty()) return emptyList()
+        return lams.flatMap { it.drop(1) }.distinct()
+    }
+
     // Lista atual — rápida, sem rede. Sempre devolve algo utilizável.
     fun servers(): List<String> {
         cache?.let { return it }
@@ -640,8 +665,8 @@ object XtreamApi {
     private fun criarSafeDns(): Dns {
         val doh: Dns = try {
             val bootstrapClient = OkHttpClient.Builder()
-                .connectTimeout(5, TimeUnit.SECONDS)
-                .readTimeout(5, TimeUnit.SECONDS)
+                .connectTimeout(3, TimeUnit.SECONDS)
+                .readTimeout(3, TimeUnit.SECONDS)
                 .build()
             DnsOverHttps.Builder()
                 .client(bootstrapClient)
@@ -658,17 +683,55 @@ object XtreamApi {
         }
 
         val cache = ConcurrentHashMap<String, Pair<Long, List<InetAddress>>>()
+        val falhas = ConcurrentHashMap<String, Long>()
         val ttlMs = 5 * 60 * 1000L
+        val ttlFalhaMs = 20 * 1000L
 
+        // ✅ CORREÇÃO (loga no 4G mas falha/demora no Wi-Fi): antes TODO
+        // domínio era resolvido SÓ via DoH (dns.google / 1.1.1.1). Muitos
+        // roteadores/redes Wi-Fi bloqueiam ou deixam muito lento o DoH, e
+        // aí TODA consulta estourava (5s cada, sem alternativa) e o login
+        // falhava mesmo com usuário/senha e DNS corretos. Agora a ordem é:
+        //   1) DNS do sistema (rápido, funciona na maioria das redes);
+        //   2) se o sistema falhar/vier vazio (ex.: operadora bloqueando o
+        //      domínio), cai pro DoH como antes;
+        //   3) se os dois falharem, lembra a falha por 20s pra não ficar
+        //      repetindo a espera em cada tentativa seguida.
         return object : Dns {
             override fun lookup(hostname: String): List<InetAddress> {
                 val agora = System.currentTimeMillis()
                 val emCache = cache[hostname]
                 if (emCache != null && agora - emCache.first < ttlMs) return emCache.second
 
-                val lista = doh.lookup(hostname)
-                if (lista.isNotEmpty()) cache[hostname] = agora to lista
-                return lista
+                val falhouEm = falhas[hostname]
+                if (falhouEm != null && agora - falhouEm < ttlFalhaMs) {
+                    throw java.net.UnknownHostException("Falha recente ao resolver $hostname")
+                }
+
+                val doSistema: List<InetAddress> = try {
+                    Dns.SYSTEM.lookup(hostname)
+                } catch (e: Exception) {
+                    emptyList()
+                }
+                if (doSistema.isNotEmpty()) {
+                    cache[hostname] = agora to doSistema
+                    falhas.remove(hostname)
+                    return doSistema
+                }
+
+                val doDoh: List<InetAddress> = try {
+                    doh.lookup(hostname)
+                } catch (e: Exception) {
+                    emptyList()
+                }
+                if (doDoh.isNotEmpty()) {
+                    cache[hostname] = agora to doDoh
+                    falhas.remove(hostname)
+                    return doDoh
+                }
+
+                falhas[hostname] = agora
+                throw java.net.UnknownHostException("Não foi possível resolver $hostname")
             }
         }
     }
