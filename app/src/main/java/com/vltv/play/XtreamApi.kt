@@ -288,6 +288,43 @@ class DnsFailoverInterceptor : Interceptor {
         }
 
         val hostAtual = original.url.host
+
+        // ✅ NOVO: se o dns_config.json diz a qual LÂMINA (mesmo painel) o
+        // DNS atual pertence, o failover tenta SÓ os DNS irmãos dessa
+        // lâmina, na ordem do arquivo. Eles são o mesmo painel, então o
+        // usuário/senha já vale neles — não precisa testar login em
+        // painel nenhum, e não perde tempo com DNS de outro servidor.
+        // Se o DNS não estiver em nenhuma lâmina (irmaos == null), cai no
+        // comportamento antigo logo abaixo.
+        val irmaos = DnsConfig.irmaos(hostAtual)
+        if (irmaos != null) {
+            for (servidor in irmaos) {
+                val servidorUrl = try { servidor.toHttpUrl() } catch (e: Exception) { continue }
+                if (servidorUrl.host == hostAtual) continue
+
+                val novaUrl = original.url.newBuilder()
+                    .scheme(servidorUrl.scheme)
+                    .host(servidorUrl.host)
+                    .port(servidorUrl.port)
+                    .build()
+
+                try {
+                    val response = chain
+                        .withConnectTimeout(CONNECT_TIMEOUT_RESERVA_S, TimeUnit.SECONDS)
+                        .proceed(original.newBuilder().url(novaUrl).build())
+                    if (response.isSuccessful) {
+                        XtreamApi.atualizarDnsAtivo(servidorUrl.toString() + "/")
+                        return response
+                    }
+                    response.close()
+                } catch (e: IOException) {
+                    // tenta o próximo irmão
+                }
+            }
+            // Nenhum irmão respondeu — deixa o erro original estourar
+            return chain.proceed(original)
+        }
+
         var tentativasReserva = 0
 
         // 2ª tentativa em diante: percorre os outros servidores da lista
@@ -428,6 +465,9 @@ object DnsConfig {
     }
 
     @Volatile private var cache: List<String>? = null
+    // ✅ NOVO: lâminas do dns_config.json (cada lâmina = lista de DNS do
+    // MESMO painel). Vem de servidores[].laminas[].dns.
+    @Volatile private var laminas: List<List<String>>? = null
     @Volatile private var ultimoRefreshOk = 0L
 
     private fun getAppContext(): Context? {
@@ -438,10 +478,17 @@ object DnsConfig {
         } catch (e: Exception) { null }
     }
 
-    // Lê e valida o JSON: {"servers": ["http://...", ...]}
+    // Lê e valida o JSON.
+    // ✅ CORREÇÃO: o arquivo da VPS agora é {"versao": 2, "dns": [...]}
+    // e o app só lia a chave "servers" — então ignorava o arquivo novo e
+    // ficava com a lista antiga embutida (FALLBACK). Agora aceita as duas
+    // chaves: "dns" (formato novo) e "servers" (formato antigo).
     private fun parse(raw: String): List<String>? {
         return try {
-            val arr = JSONObject(raw).optJSONArray("servers") ?: return null
+            val obj = JSONObject(raw)
+            val arr = obj.optJSONArray("dns")
+                ?: obj.optJSONArray("servers")
+                ?: return null
             val lista = mutableListOf<String>()
             for (i in 0 until arr.length()) {
                 val s = arr.optString(i, "").trim()
@@ -451,19 +498,56 @@ object DnsConfig {
         } catch (e: Exception) { null }
     }
 
+    // ✅ NOVO: lê as lâminas do JSON ({"servidores":[{"laminas":[{"dns":[...]}]}]}).
+    private fun parseLaminas(raw: String): List<List<String>> {
+        return try {
+            val servidores = JSONObject(raw).optJSONArray("servidores") ?: return emptyList()
+            val out = mutableListOf<List<String>>()
+            for (i in 0 until servidores.length()) {
+                val lams = servidores.optJSONObject(i)?.optJSONArray("laminas") ?: continue
+                for (j in 0 until lams.length()) {
+                    val dnsArr = lams.optJSONObject(j)?.optJSONArray("dns") ?: continue
+                    val lista = mutableListOf<String>()
+                    for (k in 0 until dnsArr.length()) {
+                        val u = dnsArr.optString(k, "").trim()
+                        if (u.startsWith("http://") || u.startsWith("https://")) lista.add(u)
+                    }
+                    if (lista.isNotEmpty()) out.add(lista)
+                }
+            }
+            out
+        } catch (e: Exception) { emptyList() }
+    }
+
+    private fun hostDe(url: String): String? =
+        try { url.toHttpUrl().host } catch (e: Exception) { null }
+
+    // ✅ NOVO: devolve os OUTROS DNS da mesma lâmina do host informado, na
+    // ordem do arquivo. Devolve null se o host não está em nenhuma lâmina
+    // (ou se o app ainda não tem as lâminas) — aí vale o comportamento
+    // antigo do failover.
+    fun irmaos(host: String): List<String>? {
+        servers() // garante que a lista salva já foi carregada
+        val todas = laminas ?: return null
+        val alvo = host.lowercase()
+        val lamina = todas.firstOrNull { l -> l.any { hostDe(it) == alvo } } ?: return null
+        return lamina.filter { hostDe(it) != alvo }
+    }
+
     // Lista atual — rápida, sem rede. Sempre devolve algo utilizável.
     fun servers(): List<String> {
         cache?.let { return it }
 
-        val salva = try {
+        val raw = try {
             getAppContext()
                 ?.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
                 ?.getString(KEY_JSON, null)
-                ?.let { parse(it) }
         } catch (e: Exception) { null }
+        val salva = raw?.let { parse(it) }
 
         if (salva != null) {
             cache = salva
+            laminas = parseLaminas(raw)
             return salva
         }
         return FALLBACK
@@ -495,6 +579,7 @@ object DnsConfig {
                     .edit().putString(KEY_JSON, raw).apply()
 
                 cache = lista
+                laminas = parseLaminas(raw)
                 ultimoRefreshOk = agora
                 true
             }
