@@ -184,7 +184,15 @@ class LiveTvActivity : AppCompatActivity() {
     private val extensoesTentativa = listOf("ts", "m3u8", "")
     private var extIndex = 0
 
-    private val USER_AGENT = "IPTVSmartersPro"
+    // ⚠️ VERSÃO DE TESTE: antes era "IPTVSmartersPro". Agora usa o MESMO
+    // User-Agent de navegador que o resto do app já usa nas chamadas da API
+    // (VpnInterceptor) — alguns servidores/CDNs recusam o vídeo só pro UA
+    // "IPTVSmartersPro" mesmo aceitando o login.
+    private val USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+
+    // ⚠️ DIAGNÓSTICO TEMPORÁRIO (ver mostrarDiagErro): REMOVER antes de publicar.
+    private var diagErros = 0
+    private var urlAtualDiag = ""
 
     // ✅ Categoria virtual "Favoritos" — não existe na API do provedor,
     // é injetada localmente no topo da lista de categorias. Selecioná-la
@@ -535,6 +543,7 @@ class LiveTvActivity : AppCompatActivity() {
                 }
             }
             override fun onPlayerError(error: PlaybackException) {
+                mostrarDiagErro(error)
                 extIndex++
                 if (extIndex >= extensoesTentativa.size) {
                     extIndex = 0
@@ -552,12 +561,28 @@ class LiveTvActivity : AppCompatActivity() {
         })
     }
 
+    // ⚠️ DIAGNÓSTICO TEMPORÁRIO (versão de teste): mostra o motivo real da
+    // falha do vídeo (ex.: "Response code: 404", "UnknownHostException",
+    // "SocketTimeoutException"). Só as 3 primeiras falhas de cada canal
+    // escolhido. REMOVER antes de publicar pros clientes.
+    private fun mostrarDiagErro(error: PlaybackException) {
+        if (diagErros >= 3) return
+        diagErros++
+        val causa = error.cause
+        val host = try { Uri.parse(urlAtualDiag).host } catch (e: Exception) { null } ?: "?"
+        val ext = extensoesTentativa.getOrElse(extIndex) { "?" }
+        val detalhe = "${error.errorCodeName} | ${causa?.javaClass?.simpleName ?: "-"}: ${causa?.message ?: ""}"
+        android.util.Log.e("VLTV_DIAG", "live .$ext @ $host -> $detalhe")
+        Toast.makeText(this, "DIAG .$ext @ $host\n$detalhe", Toast.LENGTH_LONG).show()
+    }
+
     private fun tocarCanal(canal: LiveStream, resetIndices: Boolean = true) {
         garantirPlayerCriado()
         canalAtual = canal
         if (resetIndices) {
             serverIndex = 0
             extIndex = 0
+            diagErros = 0
         }
 
         if (activeServerList.isEmpty()) {
@@ -573,6 +598,7 @@ class LiveTvActivity : AppCompatActivity() {
             "$server/live/$username/$password/${canal.id}"
         else
             "$server/live/$username/$password/${canal.id}.$ext"
+        urlAtualDiag = url
 
         playerLoading.visibility = View.VISIBLE
         tvPlayerChannelName.text = canal.name
