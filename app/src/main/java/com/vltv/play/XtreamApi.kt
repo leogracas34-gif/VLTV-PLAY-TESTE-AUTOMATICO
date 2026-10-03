@@ -21,6 +21,7 @@ import retrofit2.http.GET
 import retrofit2.http.Query
 import java.io.IOException
 import java.net.InetAddress
+import java.net.UnknownHostException
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -91,8 +92,23 @@ object PlanoUtils {
         val dataFormatada: String,
         val diasRestantes: Long,
         val isVitalicio: Boolean,
-        val isExpirado: Boolean
+        val isExpirado: Boolean,
+        // ✅ NOVO: texto pronto pra tela ("Vence em 5 meses", "Vence em 12
+        // dias", "Vence hoje"...). Tem valor padrão, então nenhum lugar que
+        // já cria InfoPlano(...) precisa mudar.
+        val tempoRestante: String = ""
     )
+
+    // ✅ NOVO: transforma os dias restantes em texto curto pra tela.
+    private fun textoTempoRestante(dias: Long): String = when {
+        dias < -1L  -> "Venceu há ${-dias} dias"
+        dias < 0L   -> "Venceu há 1 dia"
+        dias == 0L  -> "Vence hoje"
+        dias == 1L  -> "Vence amanhã"
+        dias < 30L  -> "Vence em $dias dias"
+        dias / 30L == 1L -> "Vence em 1 mês"
+        else        -> "Vence em ${dias / 30L} meses"
+    }
 
     fun classificarPlano(expDateRaw: String?): InfoPlano {
         if (expDateRaw.isNullOrBlank() || expDateRaw == "0" || expDateRaw == "null") {
@@ -101,7 +117,8 @@ object PlanoUtils {
                 dataFormatada  = "Vitalício",
                 diasRestantes  = Long.MAX_VALUE,
                 isVitalicio    = true,
-                isExpirado     = false
+                isExpirado     = false,
+                tempoRestante  = "Sem vencimento"
             )
         }
 
@@ -138,7 +155,10 @@ object PlanoUtils {
             val nomePlano = when {
                 diasRestantes < 0           -> "Plano Expirado"
                 mesesRestantes > MESES_VITALICIO -> "Plano Vitalício"
-                mesesRestantes > 12         -> "Plano Anual"
+                // Mais de 6 meses faltando = Anual (as duas faixas antigas
+                // "> 12" e "> 6" davam o mesmo resultado, foram unidas).
+                // Cliente semestral que renova e passa de 6 meses vira
+                // Anual sozinho; se ficar em até 6, continua Semestral.
                 mesesRestantes > 6          -> "Plano Anual"
                 mesesRestantes > 3          -> "Plano Semestral"
                 mesesRestantes > 1          -> "Plano Trimestral"
@@ -152,7 +172,8 @@ object PlanoUtils {
                 dataFormatada = if (isVitalicio) "Vitalício" else "Válido até $dataFormatada",
                 diasRestantes = diasRestantes,
                 isVitalicio   = isVitalicio,
-                isExpirado    = diasRestantes < 0
+                isExpirado    = diasRestantes < 0,
+                tempoRestante = textoTempoRestante(diasRestantes)
             )
         } catch (e: Exception) {
             InfoPlano("Sem informação", "", 0, false, false)
@@ -234,105 +255,48 @@ interface XtreamService {
 // conta logava normalmente, mas nada era baixado depois. Trocado para o
 // mesmo UA completo de Chrome já usado no login, mais Accept-Language pra
 // ficar o mais parecido possível com um navegador/player real.
-// ✅ NOVO: UaHelper — cada painel Xtream tem a sua regra de User-Agent
-// (uns só aceitam navegador completo, outros só aceitam UA de player
-// IPTV). Em vez de fixar um UA pra todos, o app tenta o padrão (Chrome) e,
-// se o painel responder 403/406, tenta o UA de player; o que funcionar
-// fica gravado POR DOMÍNIO (e persiste entre aberturas do app).
-object UaHelper {
-    const val CHROME = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-    const val PLAYER = "IPTVSmartersPro"
-
-    private const val PREFS = "vltv_ua_host"
-    private val preferido = ConcurrentHashMap<String, String>()
-    @Volatile private var carregado = false
-
-    private fun ctx(): Context? = try {
-        Class.forName("android.app.ActivityThread")
-            .getMethod("currentApplication").invoke(null) as? Context
-    } catch (e: Exception) { null }
-
-    private fun carregar() {
-        if (carregado) return
-        val c = ctx() ?: return
-        try {
-            c.getSharedPreferences(PREFS, Context.MODE_PRIVATE).all.forEach { (k, v) ->
-                if (v is String) preferido[k] = v
-            }
-        } catch (e: Exception) { }
-        carregado = true
-    }
-
-    fun paraHost(host: String): String {
-        carregar()
-        return preferido[host.lowercase()] ?: CHROME
-    }
-
-    // UA preferido primeiro, depois os outros.
-    fun ordemParaHost(host: String): List<String> {
-        val p = paraHost(host)
-        return listOf(p) + listOf(CHROME, PLAYER).filter { it != p }
-    }
-
-    fun lembrar(host: String, ua: String) {
-        val h = host.lowercase()
-        if (preferido[h] == ua) return
-        preferido[h] = ua
-        try {
-            ctx()?.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-                ?.edit()?.putString(h, ua)?.apply()
-        } catch (e: Exception) { }
-    }
-}
-
 class VpnInterceptor : Interceptor {
-    private fun montar(original: Request, ua: String): Request =
-        original.newBuilder()
-            .header("User-Agent", ua)
+    override fun intercept(chain: Interceptor.Chain): Response {
+        val request = chain.request().newBuilder()
+            .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
             .header("Accept", "*/*")
             .header("Accept-Language", "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7")
             .build()
-
-    override fun intercept(chain: Interceptor.Chain): Response {
-        val original = chain.request()
-        val host = original.url.host
-        val uas = UaHelper.ordemParaHost(host)
-
-        var resp = chain.proceed(montar(original, uas[0]))
-        if (resp.code != 403 && resp.code != 406) return resp
-
-        // Painel recusou esse UA — tenta os outros antes de desistir.
-        for (alt in uas.drop(1)) {
-            resp.close()
-            resp = chain.proceed(montar(original, alt))
-            if (resp.code != 403 && resp.code != 406) {
-                UaHelper.lembrar(host, alt)
-                return resp
-            }
-        }
-        return resp
+        return chain.proceed(request)
     }
 }
 
 // ---------------------
 // Interceptor de Failover automático de DNS
 // ---------------------
-// Se a chamada falhar no DNS atual (erro de rede ou resposta não-OK),
-// tenta os outros DNS da lista XtreamApi.SERVERS, um por um, mantendo o
-// mesmo caminho e os mesmos parâmetros (username/password/action). No
-// primeiro que responder com sucesso, essa resposta é devolvida pro app
-// normalmente e esse DNS passa a ser o novo "ativo" (persistido).
+// Se a chamada falhar no DNS atual (erro de rede ou resposta de erro de
+// servidor), tenta os outros DNS, um por um, mantendo o mesmo caminho e
+// os mesmos parâmetros (username/password/action). No primeiro que
+// responder com sucesso, essa resposta é devolvida pro app normalmente e
+// esse DNS passa a ser o novo "ativo" (persistido).
 //
 // ✅ CORREÇÃO (logout / DNS trocado sozinho): antes, qualquer servidor
 // reserva que respondesse HTTP 200 era aceito — mesmo um painel onde o
-// usuário NÃO existe (que responde 200 com "auth":0). Resultado: se o
-// seu servidor ficasse fora do ar por alguns instantes, o app pulava pra
-// outro painel, recebia "auth":0, gravava esse painel errado como DNS
-// ativo e tratava a conta como inválida. Agora, antes de aceitar um
-// servidor reserva, o interceptor confirma com uma chamada de login que
-// o usuário/senha realmente são aceitos ali. Espelhos do mesmo painel
-// continuam funcionando normalmente como failover; painéis de outros
-// servidores são ignorados e nunca viram o DNS ativo.
+// usuário NÃO existe (que responde 200 com "auth":0). Agora, antes de
+// aceitar um servidor reserva, o interceptor confirma com uma chamada de
+// login que o usuário/senha realmente são aceitos ali. Espelhos do mesmo
+// painel continuam funcionando normalmente como failover; painéis de
+// outros servidores são ignorados e nunca viram o DNS ativo.
+//
+// ✅ MELHORIAS desta versão:
+//  1) Só dispara failover quando o erro indica problema DO SERVIDOR/DNS
+//     (exceção de rede, 5xx, 403, 404, 408, 429). Antes, qualquer código
+//     não-2xx (ex.: 400/401) rodava até 3 reservas à toa, deixando a
+//     tela lenta sem nenhuma chance de melhorar.
+//  2) Quando TODOS falham, devolve o erro ORIGINAL que já tinha ocorrido
+//     em vez de repetir a requisição original uma 3ª vez (antes eram
+//     até 15s de connect timeout a mais pro usuário esperar).
+//  3) A validação de login do servidor reserva fica em cache por 60s —
+//     várias chamadas seguidas durante uma queda não refazem o login
+//     de validação a cada uma.
+//  4) Quando a conexão falha com o IP que o DNS do sistema deu, avisa o
+//     SmartDns pra tentar o DoH primeiro nesse domínio (cobre IP falso/
+//     bloqueado pela operadora).
 class DnsFailoverInterceptor : Interceptor {
 
     companion object {
@@ -341,67 +305,57 @@ class DnsFailoverInterceptor : Interceptor {
         // tenta no máximo 3 reservas, com timeout curto de conexão.
         private const val MAX_TENTATIVAS_RESERVA = 3
         private const val CONNECT_TIMEOUT_RESERVA_S = 8
+        private const val VALIDACAO_TTL_MS = 60_000L
         private val REGEX_AUTH_ZERO = Regex("\"auth\"\\s*:\\s*\"?0\"?")
+
+        // "host|usuario" -> momento em que o login foi confirmado.
+        private val validados = ConcurrentHashMap<String, Long>()
+
+        // Códigos que indicam problema do servidor/espelho (vale tentar outro).
+        // 400/401 etc. são erro do pedido/conta: outro espelho não resolve.
+        private fun codigoPedeFailover(code: Int): Boolean =
+            code >= 500 || code == 403 || code == 404 || code == 408 || code == 429
     }
 
     override fun intercept(chain: Interceptor.Chain): Response {
         val original = chain.request()
+        val hostAtual = original.url.host
+
+        // Guardamos a 1ª falha pra devolver no fim se nenhum reserva servir.
+        var falhaHttp: Response? = null
+        var falhaIo: IOException? = null
 
         // 1ª tentativa: DNS atual
         try {
             val response = chain.proceed(original)
-            if (response.isSuccessful) return response
-            response.close()
+            if (response.isSuccessful || !codigoPedeFailover(response.code)) return response
+            falhaHttp = response // mantém aberto; fechado se um reserva funcionar
         } catch (e: IOException) {
-            // segue pro failover
+            falhaIo = e
+            // IP do sistema pode estar falso/bloqueado: próxima resolução
+            // desse domínio tenta o DoH primeiro.
+            XtreamApi.dnsSugerirDoh(hostAtual)
         }
 
-        val hostAtual = original.url.host
-
-        // ✅ NOVO: se o dns_config.json diz a qual LÂMINA (mesmo painel) o
-        // DNS atual pertence, o failover tenta SÓ os DNS irmãos dessa
-        // lâmina, na ordem do arquivo. Eles são o mesmo painel, então o
+        // ✅ Se o dns_config.json diz a qual LÂMINA (mesmo painel) o DNS
+        // atual pertence, o failover tenta SÓ os DNS irmãos dessa lâmina,
+        // na ordem do arquivo. Eles são o mesmo painel, então o
         // usuário/senha já vale neles — não precisa testar login em
-        // painel nenhum, e não perde tempo com DNS de outro servidor.
-        // Se o DNS não estiver em nenhuma lâmina (irmaos == null), cai no
-        // comportamento antigo logo abaixo.
+        // painel nenhum. Se o DNS não estiver em nenhuma lâmina
+        // (irmaos == null), cai no comportamento de percorrer SERVERS.
         val irmaos = DnsConfig.irmaos(hostAtual)
-        if (irmaos != null) {
-            for (servidor in irmaos) {
-                val servidorUrl = try { servidor.toHttpUrl() } catch (e: Exception) { continue }
-                if (servidorUrl.host == hostAtual) continue
-
-                val novaUrl = original.url.newBuilder()
-                    .scheme(servidorUrl.scheme)
-                    .host(servidorUrl.host)
-                    .port(servidorUrl.port)
-                    .build()
-
-                try {
-                    val response = chain
-                        .withConnectTimeout(CONNECT_TIMEOUT_RESERVA_S, TimeUnit.SECONDS)
-                        .proceed(original.newBuilder().url(novaUrl).build())
-                    if (response.isSuccessful) {
-                        XtreamApi.atualizarDnsAtivo(servidorUrl.toString() + "/")
-                        return response
-                    }
-                    response.close()
-                } catch (e: IOException) {
-                    // tenta o próximo irmão
-                }
-            }
-            // Nenhum irmão respondeu — deixa o erro original estourar
-            return chain.proceed(original)
-        }
+        val candidatos: List<String> = irmaos ?: XtreamApi.SERVERS
+        val precisaValidar = irmaos == null
 
         var tentativasReserva = 0
 
-        // 2ª tentativa em diante: percorre os outros servidores da lista
-        for (servidor in XtreamApi.SERVERS) {
+        for (servidor in candidatos) {
             val servidorUrl = try { servidor.toHttpUrl() } catch (e: Exception) { continue }
             if (servidorUrl.host == hostAtual) continue
-            if (tentativasReserva >= MAX_TENTATIVAS_RESERVA) break
-            tentativasReserva++
+            if (precisaValidar) {
+                if (tentativasReserva >= MAX_TENTATIVAS_RESERVA) break
+                tentativasReserva++
+            }
 
             val novaUrl = original.url.newBuilder()
                 .scheme(servidorUrl.scheme)
@@ -409,30 +363,32 @@ class DnsFailoverInterceptor : Interceptor {
                 .port(servidorUrl.port)
                 .build()
 
-            // ✅ Só aceita este servidor reserva se ele reconhecer o
+            // ✅ Só aceita servidor de OUTRA lista se ele reconhecer o
             // usuário/senha. Se não reconhecer, ignora e tenta o próximo.
-            if (!usuarioAceitoNoServidor(chain, original, novaUrl)) continue
-
-            val novoRequest = original.newBuilder().url(novaUrl).build()
+            if (precisaValidar && !usuarioAceitoNoServidor(chain, original, novaUrl)) continue
 
             try {
                 val response = chain
                     .withConnectTimeout(CONNECT_TIMEOUT_RESERVA_S, TimeUnit.SECONDS)
-                    .proceed(novoRequest)
+                    .proceed(original.newBuilder().url(novaUrl).build())
                 if (response.isSuccessful) {
                     // Esse DNS respondeu E aceita o usuário — vira o novo
                     // DNS ativo do app
+                    falhaHttp?.close()
                     XtreamApi.atualizarDnsAtivo(servidorUrl.toString() + "/")
                     return response
                 }
                 response.close()
             } catch (e: IOException) {
+                if (falhaIo == null) falhaIo = e
                 // tenta o próximo
             }
         }
 
-        // Nenhum DNS respondeu — deixa o erro original estourar normalmente
-        return chain.proceed(original)
+        // Nenhum reserva respondeu — devolve o erro original (sem refazer
+        // a requisição à toa).
+        falhaHttp?.let { return it }
+        throw falhaIo ?: IOException("Nenhum servidor respondeu")
     }
 
     // Faz uma chamada de login (player_api.php sem "action") no servidor
@@ -450,7 +406,13 @@ class DnsFailoverInterceptor : Interceptor {
         // o comportamento antigo.
         if (user.isNullOrBlank() || pass.isNullOrBlank()) return true
 
-        return try {
+        // ✅ Cache de validação (só guarda host+usuário, nunca a senha).
+        val chaveCache = "${novaUrl.host}|$user"
+        val agora = System.currentTimeMillis()
+        val ultimo = validados[chaveCache]
+        if (ultimo != null && agora - ultimo < VALIDACAO_TTL_MS) return true
+
+        val aceito = try {
             val urlLogin = novaUrl.newBuilder()
                 .query(null)
                 .addQueryParameter("username", user)
@@ -469,6 +431,112 @@ class DnsFailoverInterceptor : Interceptor {
         } catch (e: Exception) {
             false
         }
+
+        if (aceito) validados[chaveCache] = agora
+        return aceito
+    }
+}
+
+// ---------------------
+// ✅ NOVO: SmartDns — resolvedor inteligente
+// ---------------------
+// Problema que resolve: o app resolvia TUDO só por DNS-over-HTTPS
+// (dns.google / 1.1.1.1). Muitos roteadores/Wi-Fi bloqueiam ou travam o
+// DoH, então a consulta falhava e o login não entrava mesmo com usuário,
+// senha e DNS certos (no 4G o DoH passa, por isso funcionava lá).
+//
+// Ordem de resolução agora:
+//   1) Cache em memória (5 min) — zero custo nas chamadas seguintes.
+//   2) DNS do SISTEMA (rápido, e é o que o XCIPTV/Smart Player usam).
+//   3) DoH (Google, depois Cloudflare) — só se o sistema falhar OU
+//      devolver IP falso (0.0.0.0 / 127.x / link-local, que é como
+//      várias operadoras "bloqueiam" um domínio).
+//   4) Se tudo falhar: lembra a falha por 20s (não fica esperando timeout
+//      de novo a cada tentativa) e, se existir um IP antigo guardado,
+//      usa ele como último recurso ("serve-stale").
+//
+// Se a CONEXÃO falhar usando o IP do sistema (IP falso "público" que
+// passou pelo filtro), o DnsFailoverInterceptor chama penalizarSistema():
+// por 5 min esse domínio passa a tentar o DoH primeiro.
+class SmartDns(private val resolvedoresDoh: List<Dns>) : Dns {
+
+    private class Entrada(val tempo: Long, val ips: List<InetAddress>)
+
+    companion object {
+        private const val TTL_OK_MS = 5 * 60 * 1000L
+        private const val TTL_FALHA_MS = 20 * 1000L
+        private const val TTL_PREFERIR_DOH_MS = 5 * 60 * 1000L
+    }
+
+    private val cachePositivo = ConcurrentHashMap<String, Entrada>()
+    private val cacheFalha = ConcurrentHashMap<String, Long>()
+    private val preferirDoh = ConcurrentHashMap<String, Long>()
+
+    // IP "de bloqueio" típico: 0.0.0.0, 127.x, link-local, multicast.
+    // IPs privados (192.168.x etc.) continuam válidos de propósito, pra
+    // não quebrar quem usa painel em rede local.
+    private fun ipValido(ip: InetAddress): Boolean =
+        !(ip.isAnyLocalAddress || ip.isLoopbackAddress || ip.isLinkLocalAddress || ip.isMulticastAddress)
+
+    private fun ehIpLiteral(host: String): Boolean =
+        host.contains(':') || host.all { it.isDigit() || it == '.' }
+
+    private fun viaSistema(host: String): List<InetAddress> =
+        try { Dns.SYSTEM.lookup(host).filter { ipValido(it) } } catch (e: Exception) { emptyList() }
+
+    private fun viaDoh(host: String): List<InetAddress> {
+        for (resolvedor in resolvedoresDoh) {
+            try {
+                val lista = resolvedor.lookup(host).filter { ipValido(it) }
+                if (lista.isNotEmpty()) return lista
+            } catch (e: Exception) {
+                // tenta o próximo resolvedor DoH
+            }
+        }
+        return emptyList()
+    }
+
+    override fun lookup(hostname: String): List<InetAddress> {
+        // Host que já é um IP não precisa de resolução nem de filtro.
+        if (ehIpLiteral(hostname)) return Dns.SYSTEM.lookup(hostname)
+
+        val agora = System.currentTimeMillis()
+
+        cachePositivo[hostname]?.let { if (agora - it.tempo < TTL_OK_MS) return it.ips }
+
+        // Falhou há pouco: não gasta timeout de novo.
+        val falhouEm = cacheFalha[hostname]
+        if (falhouEm != null && agora - falhouEm < TTL_FALHA_MS) {
+            cachePositivo[hostname]?.let { return it.ips }
+            throw UnknownHostException("DNS falhou há pouco para $hostname")
+        }
+
+        val dohPrimeiro = agora - (preferirDoh[hostname] ?: 0L) < TTL_PREFERIR_DOH_MS
+        val ips = if (dohPrimeiro) {
+            viaDoh(hostname).ifEmpty { viaSistema(hostname) }
+        } else {
+            viaSistema(hostname).ifEmpty { viaDoh(hostname) }
+        }
+
+        if (ips.isNotEmpty()) {
+            cachePositivo[hostname] = Entrada(agora, ips)
+            cacheFalha.remove(hostname)
+            return ips
+        }
+
+        cacheFalha[hostname] = agora
+        // Último recurso: IP antigo (expirado) é melhor que erro.
+        cachePositivo[hostname]?.let { return it.ips }
+        throw UnknownHostException("Não foi possível resolver $hostname")
+    }
+
+    // Chamado quando a conexão falhou com o IP resolvido: descarta o cache
+    // desse domínio e faz a próxima resolução começar pelo DoH.
+    fun penalizarSistema(hostname: String) {
+        if (ehIpLiteral(hostname)) return
+        cachePositivo.remove(hostname)
+        cacheFalha.remove(hostname)
+        preferirDoh[hostname] = System.currentTimeMillis()
     }
 }
 
@@ -603,31 +671,6 @@ object DnsConfig {
         return lamina.filter { hostDe(it) != alvo }
     }
 
-    // ✅ NOVO: 1ª rodada do teste de login — só o PRIMEIRO DNS de cada
-    // lâmina (cada lâmina = um painel), mais qualquer DNS da lista que
-    // não esteja em nenhuma lâmina. Em vez de testar todos os DNS de uma
-    // vez, testa só 1 por painel (poucos pedidos simultâneos). Se o
-    // arquivo não tem lâminas, devolve a lista inteira (comportamento
-    // antigo).
-    fun primeiraRodada(): List<String> {
-        val todos = servers()
-        val lams = laminas
-        if (lams.isNullOrEmpty()) return todos
-        val primeiros = lams.map { it.first() }
-        val dentroDeLamina = lams.flatten().toSet()
-        val soltos = todos.filter { it !in dentroDeLamina }
-        return (primeiros + soltos).distinct()
-    }
-
-    // ✅ NOVO: 2ª rodada — os DNS "irmãos" que ficaram de fora da 1ª.
-    // Só roda se ninguém respondeu na 1ª rodada.
-    fun segundaRodada(): List<String> {
-        servers()
-        val lams = laminas
-        if (lams.isNullOrEmpty()) return emptyList()
-        return lams.flatMap { it.drop(1) }.distinct()
-    }
-
     // Lista atual — rápida, sem rede. Sempre devolve algo utilizável.
     fun servers(): List<String> {
         cache?.let { return it }
@@ -640,8 +683,10 @@ object DnsConfig {
         val salva = raw?.let { parse(it) }
 
         if (salva != null) {
-            cache = salva
+            // ✅ Ordem trocada: lâminas ANTES do cache. Quem lê "cache"
+            // pronto e chama irmaos() agora nunca pega lâminas vazias.
             laminas = parseLaminas(raw)
+            cache = salva
             return salva
         }
         return FALLBACK
@@ -672,8 +717,9 @@ object DnsConfig {
                     .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
                     .edit().putString(KEY_JSON, raw).apply()
 
-                cache = lista
+                // ✅ lâminas antes do cache (mesmo motivo de servers())
                 laminas = parseLaminas(raw)
+                cache = lista
                 ultimoRefreshOk = agora
                 true
             }
@@ -714,103 +760,46 @@ object XtreamApi {
             .build()
     }
 
-    // ✅ NOVO: não é mais "private" — o LoginActivity agora reaproveita
-    // este mesmo resolvedor DNS-over-HTTPS na fase de teste de login
-    // (clientRapido/clientLento), pra contornar bloqueio de DNS feito
-    // pela operadora em domínios específicos (ex.: supertv.red,
-    // sivimcdn.click), sem duplicar a configuração do DoH em dois
-    // lugares diferentes.
     // ✅ Uma única instância compartilhada (XtreamApi + LoginActivity).
-    private val safeDns: Dns by lazy { criarSafeDns() }
+    // O LoginActivity reaproveita este mesmo resolvedor na fase de teste
+    // de login (clientRapido/clientLento), sem duplicar a configuração.
+    // Continua devolvendo "Dns" em buildSafeDns(), então quem já chama
+    // não precisa mudar nada.
+    private val safeDns: SmartDns by lazy { criarSafeDns() }
 
     fun buildSafeDns(): Dns = safeDns
 
-    // ✅ DoH continua sendo usado (contorna bloqueio de DNS da operadora),
-    // mas agora com CACHE em memória de 5 min por domínio. Antes cada nova
-    // conexão refazia a consulta HTTPS ao dns.google (sem cache nenhum),
-    // coisa que XCIPTV/Smart Player não fazem. O cliente de bootstrap
-    // também ganhou timeouts curtos (5s) pra uma consulta lenta não
-    // segurar a conexão por 10s.
-    // ✅ NOVO: coloca os endereços IPv4 antes dos IPv6. Em muitos Wi-Fi o
-    // IPv6 "aparece" mas não tem saída pra internet; se o IPv6 vem
-    // primeiro, cada conexão fica esperando o timeout inteiro nele antes
-    // de tentar o IPv4 (login lento ou que nunca entra no Wi-Fi, mas normal
-    // no 4G). Os IPv6 continuam na lista como reserva.
-    private fun ipv4Primeiro(lista: List<InetAddress>): List<InetAddress> =
-        lista.sortedBy { if (it is java.net.Inet4Address) 0 else 1 }
+    // ✅ Chamado pelo DnsFailoverInterceptor quando a conexão falha com o
+    // IP que o DNS do sistema deu: esse domínio passa a tentar o DoH
+    // primeiro por 5 min.
+    fun dnsSugerirDoh(host: String) = safeDns.penalizarSistema(host)
 
-    private fun criarSafeDns(): Dns {
-        val doh: Dns = try {
+    // Monta um resolvedor DoH. Devolve null se não conseguir montar
+    // (aí o SmartDns segue só com o DNS do sistema).
+    private fun criarDoh(url: String, bootstrapIps: List<String>): Dns? {
+        return try {
             val bootstrapClient = OkHttpClient.Builder()
-                .connectTimeout(3, TimeUnit.SECONDS)
-                .readTimeout(3, TimeUnit.SECONDS)
+                .connectTimeout(5, TimeUnit.SECONDS)
+                .readTimeout(5, TimeUnit.SECONDS)
                 .build()
             DnsOverHttps.Builder()
                 .client(bootstrapClient)
-                .url("https://dns.google/dns-query".toHttpUrl())
-                .bootstrapDnsHosts(
-                    listOf(
-                        InetAddress.getByName("8.8.8.8"),
-                        InetAddress.getByName("1.1.1.1")
-                    )
-                )
+                .url(url.toHttpUrl())
+                .bootstrapDnsHosts(bootstrapIps.map { InetAddress.getByName(it) })
                 .build()
         } catch (e: Exception) {
-            return Dns.SYSTEM
+            null
         }
+    }
 
-        val cache = ConcurrentHashMap<String, Pair<Long, List<InetAddress>>>()
-        val falhas = ConcurrentHashMap<String, Long>()
-        val ttlMs = 5 * 60 * 1000L
-        val ttlFalhaMs = 20 * 1000L
-
-        // ✅ CORREÇÃO (loga no 4G mas falha/demora no Wi-Fi): antes TODO
-        // domínio era resolvido SÓ via DoH (dns.google / 1.1.1.1). Muitos
-        // roteadores/redes Wi-Fi bloqueiam ou deixam muito lento o DoH, e
-        // aí TODA consulta estourava (5s cada, sem alternativa) e o login
-        // falhava mesmo com usuário/senha e DNS corretos. Agora a ordem é:
-        //   1) DNS do sistema (rápido, funciona na maioria das redes);
-        //   2) se o sistema falhar/vier vazio (ex.: operadora bloqueando o
-        //      domínio), cai pro DoH como antes;
-        //   3) se os dois falharem, lembra a falha por 20s pra não ficar
-        //      repetindo a espera em cada tentativa seguida.
-        return object : Dns {
-            override fun lookup(hostname: String): List<InetAddress> {
-                val agora = System.currentTimeMillis()
-                val emCache = cache[hostname]
-                if (emCache != null && agora - emCache.first < ttlMs) return emCache.second
-
-                val falhouEm = falhas[hostname]
-                if (falhouEm != null && agora - falhouEm < ttlFalhaMs) {
-                    throw java.net.UnknownHostException("Falha recente ao resolver $hostname")
-                }
-
-                val doSistema: List<InetAddress> = try {
-                    ipv4Primeiro(Dns.SYSTEM.lookup(hostname))
-                } catch (e: Exception) {
-                    emptyList()
-                }
-                if (doSistema.isNotEmpty()) {
-                    cache[hostname] = agora to doSistema
-                    falhas.remove(hostname)
-                    return doSistema
-                }
-
-                val doDoh: List<InetAddress> = try {
-                    ipv4Primeiro(doh.lookup(hostname))
-                } catch (e: Exception) {
-                    emptyList()
-                }
-                if (doDoh.isNotEmpty()) {
-                    cache[hostname] = agora to doDoh
-                    falhas.remove(hostname)
-                    return doDoh
-                }
-
-                falhas[hostname] = agora
-                throw java.net.UnknownHostException("Não foi possível resolver $hostname")
-            }
-        }
+    // ✅ DNS do sistema PRIMEIRO; DoH (Google e depois Cloudflare — se uma
+    // rede bloqueia um, o outro pode passar) só como reserva. Ver SmartDns.
+    private fun criarSafeDns(): SmartDns {
+        val resolvedoresDoh = listOfNotNull(
+            criarDoh("https://dns.google/dns-query", listOf("8.8.8.8", "8.8.4.4")),
+            criarDoh("https://cloudflare-dns.com/dns-query", listOf("1.1.1.1", "1.0.0.1"))
+        )
+        return SmartDns(resolvedoresDoh)
     }
 
     init {
@@ -896,38 +885,48 @@ object XtreamApi {
             }
         }
 
+    // ✅ Uma instância só de Gson (criar uma por chamada é caro).
+    private val gson = Gson()
+
+    // ✅ CORREÇÃO: antes o TypeToken usava "List<T>" com T genérico, que
+    // some em tempo de execução (type erasure) — o Gson devolvia uma lista
+    // de mapas soltos e o parâmetro "clazz" nunca era usado. Agora o tipo
+    // concreto é montado a partir do "clazz", então vem List<LiveCategory>
+    // (ou o que o chamador pedir) de verdade.
     fun <T> parseCategoryList(responseBody: ResponseBody?, clazz: Class<T>): List<T>? {
         return try {
             val json = responseBody?.string() ?: return null
-            Gson().fromJson<List<T>>(json, object : TypeToken<List<T>>() {}.type)
+            val tipo = TypeToken.getParameterized(List::class.java, clazz).type
+            gson.fromJson<List<T>>(json, tipo)
         } catch (e: Exception) { null }
     }
 
-    // ✅ evita repetir o "aquecimento" de conexão várias vezes seguidas.
+    // ✅ evita repetir o "aquecimento" pro MESMO host. Antes era um
+    // boolean global: se o failover trocasse de DNS, o novo host nunca
+    // era aquecido.
     @Volatile
-    private var dnsAquecido = false
+    private var hostAquecido: String? = null
 
     // ✅ "aquece" a resolução de DNS do servidor ativo em segundo plano,
     // chamado assim que uma tela abre (ex.: LiveTvActivity), ANTES do
-    // usuário pedir pra tocar algo. Usa só o resolvedor do sistema
-    // (InetAddress.getByName) — uma única resolução, sem disparar nada
-    // em paralelo e sem chamada HTTPS extra pra um servidor de DoH. É
-    // exatamente o mesmo caminho de DNS que o ExoPlayer vai reaproveitar
-    // na hora de conectar no vídeo, então isso tira só a resolução de
-    // DNS do caminho crítico do primeiro play, sem gerar tráfego de
-    // fundo continuado.
+    // usuário pedir pra tocar algo. Agora passa pelo mesmo SmartDns que o
+    // OkHttp usa — então o resultado já fica no cache dele (a primeira
+    // chamada real não paga resolução) e, como o SmartDns consulta o DNS
+    // do sistema primeiro, o cache do Android que o ExoPlayer reaproveita
+    // também fica aquecido. Uma única resolução, sem tráfego de fundo.
     fun aquecerConexao() {
-        if (dnsAquecido) return
         val hostAlvo = try {
             baseUrl.ifBlank { null }?.toHttpUrl()?.host
         } catch (e: Exception) { null } ?: return
+        if (hostAquecido == hostAlvo) return
+        hostAquecido = hostAlvo
 
         Thread {
             try {
-                InetAddress.getByName(hostAlvo)
-                dnsAquecido = true
+                safeDns.lookup(hostAlvo)
             } catch (e: Exception) {
-                // Silencioso — é só uma otimização.
+                // Silencioso — é só uma otimização. Libera pra tentar de novo.
+                hostAquecido = null
             }
         }.start()
     }
