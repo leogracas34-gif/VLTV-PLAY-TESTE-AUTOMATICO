@@ -3,7 +3,6 @@ package com.vltv.play
 import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
-import android.content.res.Configuration
 import android.graphics.Color
 import android.os.Bundle
 import android.view.KeyEvent
@@ -30,6 +29,8 @@ import com.bumptech.glide.Priority
 import com.bumptech.glide.load.DecodeFormat
 import com.google.android.material.bottomnavigation.BottomNavigationView
 import kotlinx.coroutines.*
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import org.json.JSONObject
 import java.net.URL
 import java.net.URLEncoder
@@ -55,14 +56,20 @@ class SeriesActivity : AppCompatActivity() {
     private var password = ""
     private lateinit var seriesCachePrefs: SharedPreferences
 
-    // ✅ NOVO: controle de "última sincronização" por categoria, salvo em
-    // SharedPreferences (sobrevive entre aberturas da Activity/app, ao
-    // contrário do seriesCache que é só em memória). Usado para não bater
-    // no servidor de novo toda vez que a tela de Séries é reaberta — ver
-    // categoriaEstaFresca() / marcarCategoriaSincronizada() mais abaixo.
-    // Mesma correção aplicada no VodActivity.
+    // Controle de "última sincronização" por categoria (sobrevive entre
+    // aberturas da Activity/app).
     private lateinit var syncPrefs: SharedPreferences
     private val SYNC_STALE_MS = 6 * 60 * 60 * 1000L // 6 horas
+
+    // ✅ NOVO: depois que o TMDB responde "essa série não tem logo", o app
+    // lembra por 7 dias e não pergunta de novo a cada rolagem.
+    private val SEM_LOGO_TTL_MS = 7L * 24 * 60 * 60 * 1000
+
+    // ✅ NOVO: no máximo 3 buscas de logo ao mesmo tempo.
+    private val logoSemaphore = Semaphore(3)
+
+    // ✅ NOVO: Regex criada UMA vez (antes era recriada a cada chamada).
+    private val regexAno = Regex("\\b(19|20)\\d{2}\\b")
 
     private val seriesCache = mutableMapOf<String, List<SeriesStream>>()
     private val logoMemoryCache = mutableMapOf<String, String>()
@@ -85,34 +92,35 @@ class SeriesActivity : AppCompatActivity() {
     // Detecção de TV centralizada em DeviceUtils.kt (context.isTelevisionDevice()),
     // usada em todo o app — não reimplementar localmente aqui.
 
-    // ✅ Filtro central de conteúdo adulto para SÉRIES — chamado em TODO ponto
-    // onde uma lista vai pro adapter, não importa de onde os dados vieram
-    // (cache em memória, ContentRepository, banco Room, rede ou favoritos).
+    // Filtro central de conteúdo adulto para SÉRIES. Agora é chamado
+    // DENTRO do submitList do adapter (thread de fundo).
     private fun filtrarSeriesAdultas(lista: List<SeriesStream>): List<SeriesStream> {
         return if (ParentalControlManager.isEnabled(this))
             lista.filterNot { ParentalControlManager.isAdultName(it.name) }
         else lista
     }
 
-    // ✅ Filtro central de conteúdo adulto para CATEGORIAS
+    // Filtro central de conteúdo adulto para CATEGORIAS
     private fun filtrarCategoriasAdultas(lista: List<LiveCategory>): List<LiveCategory> {
         return if (ParentalControlManager.isEnabled(this))
             lista.filterNot { ParentalControlManager.isAdultName(it.name) }
         else lista
     }
 
-    // ✅ NOVO: extrai o ano (19xx ou 20xx) embutido no nome da série, ex:
-    // "Nome da Série (2026)" → 2026. Usado para ordenar sempre da mais
-    // recente pra mais antiga. Séries sem ano detectável vão pro final.
-    private fun extrairAnoSerie(nome: String): Int {
-        return Regex("\\b(19|20)\\d{2}\\b").find(nome)?.value?.toIntOrNull() ?: 0
+    // Extrai o ano (19xx ou 20xx) do nome da série. Sem ano → 0 (vai pro final).
+    private fun extrairAnoSerie(nome: String?): Int {
+        if (nome.isNullOrEmpty()) return 0
+        return regexAno.find(nome)?.value?.toIntOrNull() ?: 0
     }
 
-    // ✅ NOVO: verdadeiro se essa categoria já foi sincronizada com o
-    // servidor há menos de SYNC_STALE_MS. Enquanto estiver "fresca", o app
-    // confia 100% no que já está salvo no Room/ContentRepository e NÃO
-    // busca de novo na rede — é isso que elimina o "re-sync" toda vez que
-    // a tela de Séries é reaberta.
+    // ✅ NOVO: calcula o ano UMA vez por série e depois ordena (antes o
+    // sortedByDescending chamava a Regex várias vezes por item, na thread
+    // principal). Ordem estável.
+    private fun ordenarPorAno(lista: List<SeriesStream>): List<SeriesStream> =
+        lista.map { extrairAnoSerie(it.name) to it }
+            .sortedByDescending { it.first }
+            .map { it.second }
+
     private fun categoriaEstaFresca(categoriaId: String): Boolean {
         val ultimaSync = syncPrefs.getLong("sync_$categoriaId", 0L)
         return (System.currentTimeMillis() - ultimaSync) < SYNC_STALE_MS
@@ -121,6 +129,15 @@ class SeriesActivity : AppCompatActivity() {
     private fun marcarCategoriaSincronizada(categoriaId: String) {
         syncPrefs.edit().putLong("sync_$categoriaId", System.currentTimeMillis()).apply()
     }
+
+    private fun paraStreams(lista: List<SeriesEntity>): List<SeriesStream> =
+        lista.map {
+            SeriesStream(
+                it.series_id, it.name, it.cover, it.rating, it.last_modified,
+                it.tmdb_release_date, it.is_nova_temporada == 1, it.is_novo_episodio == 1,
+                it.tmdb_proxima_temporada_data
+            )
+        }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -208,28 +225,22 @@ class SeriesActivity : AppCompatActivity() {
         ultimaCategoriaId   = catPrefs.getString("ultima_cat_id", null)
         ultimaCategoriaNome = catPrefs.getString("ultima_cat_nome", null)
 
-        // ── CARREGAMENTO INSTANTÂNEO DE SÉRIES ───────────────────────────────
+        // ── CARREGAMENTO INSTANTÂNEO DE SÉRIES (quando o repositório já está pronto) ──
         val catId = ultimaCategoriaId
         if (catId != null) {
             val seriesEmMemoria = ContentRepository.getSeriesByCategory(catId)
             if (seriesEmMemoria.isNotEmpty()) {
                 categoriaAtualId = catId
                 if (ultimaCategoriaNome != null) tvCategoryTitle.text = ultimaCategoriaNome
-                seriesEmMemoria.take(30).forEach { s ->
-                    val cached = seriesCachePrefs.getString("logo_${s.name}", null)
-                    if (cached != null) logoMemoryCache[s.name] = cached
-                }
-                val items = seriesEmMemoria.map { SeriesStream(it.series_id, it.name, it.cover, it.rating) }
-                // ✅ Filtro aplicado também no carregamento instantâneo
-                val itemsFiltrados = filtrarSeriesAdultas(items)
-                seriesAdapter?.submitList(itemsFiltrados)
-                preLoadImages(itemsFiltrados)
+                // ✅ CORRIGIDO: agora monta a série COMPLETA (selos/datas do
+                // TMDB) e aplica o MESMO filtro de recentes das outras
+                // cargas — antes aparecia sem o filtro de 90 dias aqui e
+                // com o filtro depois, e a lista "mudava sozinha".
+                seriesAdapter?.submitList(paraStreams(seriesEmMemoria), aplicarRecentes = true)
             }
         }
 
         // ── CARREGAMENTO INSTANTÂNEO DE CATEGORIAS ───────────────────────────
-        // Lê do banco Room (thread IO, ~2ms) → mostra imediatamente.
-        // A rede atualiza em background e só reaplica se ainda não havia categorias.
         lifecycleScope.launch(Dispatchers.IO) {
             try {
                 val categoriasSalvas = database.streamDao().getCategoriesByType("series")
@@ -288,9 +299,8 @@ class SeriesActivity : AppCompatActivity() {
         BottomNavProfileHelper.aplicarPerfilNoRodape(this, bottomNavigation, currentProfile, currentProfileIcon)
     }
 
-    // ✅ Corrigido: usa lifecycleScope em vez de CoroutineScope(Dispatchers.IO)
-    // solta. Assim a coroutine é cancelada automaticamente quando a Activity é
-    // destruída, evitando "You cannot start a load for a destroyed activity".
+    // Usa lifecycleScope: a coroutine é cancelada junto com a Activity,
+    // evitando "You cannot start a load for a destroyed activity".
     private fun preLoadImages(series: List<SeriesStream>) {
         lifecycleScope.launch(Dispatchers.IO) {
             series.take(30).forEach { s ->
@@ -308,29 +318,44 @@ class SeriesActivity : AppCompatActivity() {
         }
     }
 
+    // ✅ NOVO: leitura de URL com timeout (antes URL.readText() não tinha
+    // timeout nenhum).
+    private fun lerUrl(url: String): String {
+        val c = URL(url).openConnection() as java.net.HttpURLConnection
+        c.connectTimeout = 6000
+        c.readTimeout = 6000
+        return try {
+            c.inputStream.bufferedReader().use { it.readText() }
+        } finally {
+            c.disconnect()
+        }
+    }
+
+    // Devolve:
+    //  - a URL do logo, se achou;
+    //  - "" (vazio) se o TMDB respondeu e a série NÃO tem logo (vira cache negativo);
+    //  - null se deu erro de rede (não guarda nada, tenta de novo depois).
     private suspend fun searchTmdbLogoSeries(rawName: String): String? {
         val apiKey = TmdbConfig.API_KEY
-        // ✅ Delega pro TituloCleaner (fonte única) em vez de ter sua
-        // própria lista de tags sujas, incompleta em relação às outras telas.
         val cleanName = TituloCleaner.limparParaBusca(rawName)
         return try {
             val query = URLEncoder.encode(cleanName, "UTF-8")
-            val searchJson = URL(
+            val searchJson = lerUrl(
                 "https://api.themoviedb.org/3/search/tv?api_key=$apiKey&query=$query&language=pt-BR&region=BR"
-            ).readText()
+            )
             val results = JSONObject(searchJson).getJSONArray("results")
-            if (results.length() == 0) return null
+            if (results.length() == 0) return ""
             var best = results.getJSONObject(0)
             for (j in 0 until results.length()) {
                 val obj = results.getJSONObject(j)
                 if (obj.optString("name","").equals(cleanName, ignoreCase = true)) { best = obj; break }
             }
             val id = best.getString("id")
-            val imagesJson = URL(
+            val imagesJson = lerUrl(
                 "https://api.themoviedb.org/3/tv/$id/images?api_key=$apiKey&include_image_language=pt,en,null"
-            ).readText()
+            )
             val logos = JSONObject(imagesJson).getJSONArray("logos")
-            if (logos.length() == 0) return null
+            if (logos.length() == 0) return ""
             var path = ""
             for (i in 0 until logos.length()) {
                 val lg = logos.getJSONObject(i)
@@ -353,7 +378,6 @@ class SeriesActivity : AppCompatActivity() {
     /**
      * Busca categorias da REDE em background.
      * Salva no banco para a próxima abertura ser instantânea.
-     * Só reaplica na tela se o adapter ainda não foi criado (banco estava vazio).
      */
     private fun carregarCategoriasRede() {
         XtreamApi.service.getSeriesCategories(username, password)
@@ -374,7 +398,6 @@ class SeriesActivity : AppCompatActivity() {
                             }
                         }
 
-                        // Salva no banco em background
                         lifecycleScope.launch(Dispatchers.IO) {
                             try {
                                 val entities = lista.map {
@@ -385,8 +408,6 @@ class SeriesActivity : AppCompatActivity() {
                             } catch (e: Exception) { e.printStackTrace() }
                         }
 
-                        // ✅ Lista crua aqui — o filtro é aplicado dentro de
-                        // aplicarCategorias(), centralizando a regra num único lugar.
                         val cats = mutableListOf<LiveCategory>()
                         cats.add(LiveCategory(category_id = "FAV_SERIES", category_name = "FAVORITOS"))
                         cats.addAll(lista)
@@ -404,8 +425,6 @@ class SeriesActivity : AppCompatActivity() {
     private fun aplicarCategorias(categoriasOriginais: List<LiveCategory>) {
         if (isFinishing || isDestroyed) return
 
-        // ✅ Filtro central de conteúdo adulto. Roda sempre, não importa se a
-        // lista veio do banco Room (carregamento instantâneo) ou da rede.
         val categorias = filtrarCategoriasAdultas(categoriasOriginais)
         if (categorias.isEmpty()) return
 
@@ -438,90 +457,94 @@ class SeriesActivity : AppCompatActivity() {
         }
     }
 
-    // ✅ CORRIGIDO (bug do "re-sync" toda vez que reabre a tela de Séries):
-    // antes, esta função só evitava rebuscar na rede se seriesCache (memória
-    // da Activity) já tivesse a categoria — e como uma Activity NOVA é
-    // criada toda vez que você sai da tela de Séries e volta, esse cache
-    // sempre estava vazio, então o app batia no servidor de novo em TODA
-    // abertura, mesmo com os dados já salvos e corretos no Room/
-    // ContentRepository. Mesma causa do bug corrigido no VodActivity.
-    //
-    // Agora, além do cache de memória, checamos categoriaEstaFresca(): se
-    // essa categoria já foi sincronizada com o servidor há menos de
-    // SYNC_STALE_MS (6h), a função nem chega a fazer a chamada de rede —
-    // confia 100% no que já está salvo localmente.
+    // Atualização em segundo plano. Só roda se a categoria não estiver
+    // "fresca" (6h) e SÓ DEPOIS que o ContentRepository estiver pronto
+    // (sem ele não dá pra saber o que já existe, e a gravação poderia
+    // apagar selos/dados do TMDB já calculados).
     private fun atualizarEmBackground(categoria: LiveCategory) {
         if (seriesCache.containsKey(categoria.id)) return
         if (categoriaEstaFresca(categoria.id)) return
+        if (!ContentRepository.pronto) {
+            ContentRepository.aoFicarPronto {
+                if (!isFinishing && !isDestroyed && categoriaAtualId == categoria.id) {
+                    atualizarEmBackground(categoria)
+                }
+            }
+            return
+        }
         XtreamApi.service.getSeries(username, password, categoryId = categoria.id)
             .enqueue(object : Callback<List<SeriesStream>> {
                 override fun onResponse(call: Call<List<SeriesStream>>, response: Response<List<SeriesStream>>) {
                     if (!response.isSuccessful || response.body() == null) return
                     val series = response.body()!!
-                    // ✅ Cache guarda a lista crua — filtro aplicado só no submit
                     seriesCache[categoria.id] = series
-                    if (categoriaAtualId == categoria.id) {
-                        seriesAdapter?.submitList(filtrarSeriesAdultas(series))
-                    }
-                    salvarNoBancoERepositorio(categoria.id, series)
+                    // ✅ Aqui NÃO exibe a lista crua da rede (ela não traz os
+                    // selos/datas do TMDB e o filtro de recentes esconderia
+                    // séries que estavam aparecendo). Quem exibe é o
+                    // salvarNoBancoERepositorio, já com a lista mesclada
+                    // (reexibir = true) e sem rolar a tela pro topo.
+                    salvarNoBancoERepositorio(categoria.id, series, reexibir = true)
                     marcarCategoriaSincronizada(categoria.id)
                 }
                 override fun onFailure(call: Call<List<SeriesStream>>, t: Throwable) {}
             })
     }
 
+    // ✅ NOVO: lê SÓ a categoria pedida direto do Room (consulta local,
+    // milissegundos). Usada quando o ContentRepository ainda não terminou
+    // de carregar o catálogo inteiro — antes a tela ficava vazia
+    // esperando ele.
+    private suspend fun lerSeriesDoRoom(categoryId: String): List<SeriesStream> =
+        paraStreams(database.streamDao().getSeriesByCategory(categoryId))
+
     private fun carregarSeries(categoria: LiveCategory) {
         tvCategoryTitle.text = categoria.name
         categoriaAtualId = categoria.id
         salvarUltimaCategoria(categoria)
 
-        // 1. Cache de memória da API — instantâneo
+        // 1. Cache de memória da sessão — instantâneo
         seriesCache[categoria.id]?.let {
-            val filtrados = filtrarRecentes(filtrarSeriesAdultas(it))
-            seriesAdapter?.submitList(filtrados); preLoadImages(filtrados); return
+            seriesAdapter?.submitList(it, aplicarRecentes = true); return
         }
 
         // 2. ContentRepository — O(1), instantâneo (quando já está pronto)
-        //
-        // ✅ CORREÇÃO (tela aparecia vazia por alguns segundos TODA vez que
-        // abria, mesma causa do bug corrigido no VodActivity): se o usuário
-        // chegasse nesta tela antes do ContentRepository terminar de carregar
-        // em background, getSeriesByCategory() retornava lista vazia mesmo
-        // com séries salvas localmente, e caía direto no item 3 (rede), bem
-        // mais lento. Agora espera o repositório terminar (leitura local do
-        // Room, geralmente bem menos de 1 segundo, sem rede) antes de decidir
-        // se precisa mesmo buscar da rede.
-        if (!ContentRepository.pronto) {
-            ContentRepository.aoFicarPronto {
-                if (isFinishing || isDestroyed) return@aoFicarPronto
-                if (categoriaAtualId == categoria.id) carregarSeries(categoria)
+        if (ContentRepository.pronto) {
+            val emRepositorio = ContentRepository.getSeriesByCategory(categoria.id)
+            if (emRepositorio.isNotEmpty()) {
+                seriesAdapter?.submitList(paraStreams(emRepositorio), aplicarRecentes = true)
+                atualizarEmBackground(categoria)
+                return
             }
-            return
-        }
-        val emRepositorio = ContentRepository.getSeriesByCategory(categoria.id)
-        if (emRepositorio.isNotEmpty()) {
-            emRepositorio.take(30).forEach { s ->
-                val cached = seriesCachePrefs.getString("logo_${s.name}", null)
-                if (cached != null) logoMemoryCache[s.name] = cached
-            }
-            val items = emRepositorio.map {
-                SeriesStream(
-                    it.series_id, it.name, it.cover, it.rating, it.last_modified,
-                    it.tmdb_release_date, it.is_nova_temporada == 1, it.is_novo_episodio == 1,
-                    it.tmdb_proxima_temporada_data
-                )
-            }
-            val itemsFiltrados = filtrarRecentes(filtrarSeriesAdultas(items))
-            seriesAdapter?.submitList(itemsFiltrados)
-            preLoadImages(itemsFiltrados)
-            // ✅ Só tenta atualizar em segundo plano se a categoria não
-            // estiver "fresca" (ver categoriaEstaFresca) — evita o re-sync
-            // repetido toda vez que essa categoria é reaberta.
-            atualizarEmBackground(categoria)
+            carregarSeriesDaRede(categoria)
             return
         }
 
-        // 3. Sem dados locais — primeira instalação
+        // 3. ✅ CORRIGIDO: repositório ainda carregando → lê só esta
+        // categoria direto do Room (rápido) em vez de esperar o catálogo
+        // inteiro. Se a leitura falhar por qualquer motivo, cai no
+        // comportamento antigo (espera o repositório).
+        lifecycleScope.launch(Dispatchers.IO) {
+            val locais = try { lerSeriesDoRoom(categoria.id) } catch (e: Exception) { null }
+            withContext(Dispatchers.Main) {
+                if (isFinishing || isDestroyed || categoriaAtualId != categoria.id) return@withContext
+                when {
+                    locais == null -> ContentRepository.aoFicarPronto {
+                        if (!isFinishing && !isDestroyed && categoriaAtualId == categoria.id) {
+                            carregarSeries(categoria)
+                        }
+                    }
+                    locais.isNotEmpty() -> {
+                        seriesAdapter?.submitList(locais, aplicarRecentes = true)
+                        atualizarEmBackground(categoria)
+                    }
+                    else -> carregarSeriesDaRede(categoria)
+                }
+            }
+        }
+    }
+
+    // Sem dados locais — primeira instalação
+    private fun carregarSeriesDaRede(categoria: LiveCategory) {
         progressBar.visibility = View.VISIBLE
         XtreamApi.service.getSeries(username, password, categoryId = categoria.id)
             .enqueue(object : Callback<List<SeriesStream>> {
@@ -531,11 +554,9 @@ class SeriesActivity : AppCompatActivity() {
                     val series = response.body()!!
                     seriesCache[categoria.id] = series
                     if (categoriaAtualId == categoria.id) {
-                        val filtrados = filtrarRecentes(filtrarSeriesAdultas(series))
-                        seriesAdapter?.submitList(filtrados)
-                        preLoadImages(filtrados)
+                        seriesAdapter?.submitList(series, aplicarRecentes = true)
                     }
-                    salvarNoBancoERepositorio(categoria.id, series)
+                    salvarNoBancoERepositorio(categoria.id, series, reexibir = false)
                     marcarCategoriaSincronizada(categoria.id)
                 }
                 override fun onFailure(call: Call<List<SeriesStream>>, t: Throwable) {
@@ -544,28 +565,23 @@ class SeriesActivity : AppCompatActivity() {
             })
     }
 
-    // ✅ NOVO: mesma lógica do VodActivity — só mostra séries com
-    // "last_modified" (data que o provedor Xtream informa) dentro dos
-    // últimos 3 meses. Item sem essa data (0) não é escondido, pra não
-    // sumir com o catálogo inteiro caso o provedor não informe.
-    // ✅ CORREÇÃO: "last_modified" é a data que o SEU provedor atualizou o
-    // arquivo, não a data real de lançamento/atividade da série — e uma
-    // série antiga (ex: 2022) que ganhou temporada nova não pode sumir só
-    // por causa da data de estreia original. Agora considera "recente"
-    // quando qualquer um for verdade: (a) tmdb_release_date (estreia real,
-    // do TMDB) está dentro dos últimos 3 meses, (b) tem selo de Nova
-    // Temporada ou Novo Episódio ativo agora, ou (c) tem próxima temporada
-    // anunciada (Em Breve). Só cai pro "last_modified" cru quando nada
-    // disso está disponível ainda (série que o TmdbSyncHelper não checou).
+    // "last_modified" é a data que o SEU provedor atualizou o arquivo, não a
+    // data real de lançamento — então a série é considerada "recente" quando
+    // qualquer um for verdade: (a) estreia real (TMDB) nos últimos 3 meses,
+    // (b) selo de Nova Temporada/Novo Episódio ativo, (c) próxima temporada
+    // anunciada. Só cai pro "last_modified" cru quando nada disso existe.
     private fun paraEpocaSegundos(valor: Long): Long =
         if (valor > 9_999_999_999L) valor / 1000 else valor
 
+    // ✅ CORRIGIDO: o SimpleDateFormat é criado UMA vez por chamada (antes
+    // era criado de novo para cada série da lista).
     private fun filtrarRecentes(lista: List<SeriesStream>): List<SeriesStream> {
         val limiteMs = System.currentTimeMillis() - (90L * 24 * 60 * 60 * 1000)
-        val hoje = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()).format(Date())
+        val fmt = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault())
+        val hoje = fmt.format(Date())
         return lista.filter { s ->
             val dataTmdb = s.tmdb_release_date?.let {
-                try { SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()).parse(it)?.time } catch (e: Exception) { null }
+                try { fmt.parse(it)?.time } catch (e: Exception) { null }
             }
             when {
                 s.is_nova_temporada || s.is_novo_episodio -> true
@@ -577,15 +593,74 @@ class SeriesActivity : AppCompatActivity() {
         }
     }
 
-    private fun salvarNoBancoERepositorio(categoryId: String, series: List<SeriesStream>) {
+    // ✅ CORRIGIDO: antes recriava TODAS as séries só com os campos básicos
+    // e gravava tudo de novo, o que podia apagar selos/datas do TMDB já
+    // calculados (no banco e na memória, afetando a Home). Agora:
+    //  - série que já existe e não mudou (nome, capa) mantém o objeto
+    //    original COMPLETO (com tudo que o TMDB já calculou);
+    //  - só séries novas ou alteradas vão pro banco.
+    // reexibir = true: depois de mesclar, atualiza a tela com a lista
+    // mesclada (sem rolar pro topo).
+    private fun salvarNoBancoERepositorio(categoryId: String, series: List<SeriesStream>, reexibir: Boolean) {
         lifecycleScope.launch(Dispatchers.IO) {
             try {
-                val entities = series.map {
-                    SeriesEntity(it.series_id, it.name, it.cover, it.rating,
-                        categoryId, if (it.last_modified > 0) it.last_modified else System.currentTimeMillis() / 1000)
+                val existentes = ContentRepository.getSeriesByCategory(categoryId).associateBy { it.series_id }
+                // Só monta o mapa geral se aparecer série fora desta categoria
+                // (ex.: mudou de categoria no provedor).
+                val globais by lazy { ContentRepository.series.associateBy { it.series_id } }
+                val agoraSeg = System.currentTimeMillis() / 1000
+                val mesclada = ArrayList<SeriesEntity>(series.size)
+                val paraGravar = ArrayList<SeriesEntity>()
+
+                for (s in series) {
+                    val antigo = existentes[s.series_id] ?: globais[s.series_id]
+                    val novoLastModified = if (s.last_modified > 0) s.last_modified else agoraSeg
+                    if (antigo != null &&
+                        antigo.category_id == categoryId &&
+                        antigo.name == s.name &&
+                        antigo.cover == s.cover &&
+                        (s.last_modified <= 0 || antigo.last_modified == s.last_modified)
+                    ) {
+                        mesclada.add(antigo)
+                    } else {
+                        // Como o insert do DAO é REPLACE, a linha gravada
+                        // precisa estar COMPLETA: se a série já existia, usa
+                        // copy() do original (mantém logo, selos de Nova
+                        // Temporada/Episódio, TMDB, Top10, etc.) trocando só
+                        // o que veio novo do provedor.
+                        val nova = if (antigo != null) {
+                            antigo.copy(
+                                name = s.name, cover = s.cover, rating = s.rating,
+                                category_id = categoryId,
+                                last_modified = if (s.last_modified > 0) s.last_modified else antigo.last_modified
+                            )
+                        } else {
+                            SeriesEntity(
+                                s.series_id, s.name, s.cover, s.rating, categoryId, novoLastModified
+                            )
+                        }
+                        mesclada.add(nova)
+                        paraGravar.add(nova)
+                    }
                 }
-                database.streamDao().insertSeriesStreams(entities)
-                ContentRepository.atualizarCategoriaSeries(categoryId, entities)
+
+                val houveMudanca = paraGravar.isNotEmpty() || mesclada.size != existentes.size
+                if (houveMudanca) {
+                    // NonCancellable: se o usuário sair da tela no meio, a
+                    // gravação termina inteira em vez de ficar pela metade.
+                    withContext(NonCancellable) {
+                        if (paraGravar.isNotEmpty()) database.streamDao().insertSeriesStreams(paraGravar)
+                        ContentRepository.atualizarCategoriaSeries(categoryId, mesclada)
+                    }
+                }
+
+                if (reexibir) {
+                    withContext(Dispatchers.Main) {
+                        if (!isFinishing && !isDestroyed && categoriaAtualId == categoryId) {
+                            seriesAdapter?.submitList(paraStreams(mesclada), aplicarRecentes = true, rolarTopo = false)
+                        }
+                    }
+                }
             } catch (e: Exception) { e.printStackTrace() }
         }
     }
@@ -594,10 +669,10 @@ class SeriesActivity : AppCompatActivity() {
         categoriaAtualId = "FAV_SERIES"
         tvCategoryTitle.text = "FAVORITOS"
         val favIds = getFavSeries(this)
-        if (favIds.isEmpty()) { seriesAdapter?.submitList(emptyList()); return }
+        if (favIds.isEmpty()) { seriesAdapter?.submitList(emptyList(), aplicarRecentes = false); return }
         val listaNoCache = seriesCache.values.flatten().distinctBy { it.id }.filter { favIds.contains(it.id) }
         if (listaNoCache.size >= favIds.size) {
-            seriesAdapter?.submitList(filtrarSeriesAdultas(listaNoCache)); return
+            seriesAdapter?.submitList(listaNoCache, aplicarRecentes = false); return
         }
         progressBar.visibility = View.VISIBLE
         XtreamApi.service.getSeries(username, password, categoryId = "0")
@@ -609,14 +684,12 @@ class SeriesActivity : AppCompatActivity() {
                     seriesCache["ALL_FOR_FAV"] = todas
                     val favs = todas.filter { favIds.contains(it.id) }
                     if (categoriaAtualId == "FAV_SERIES") {
-                        val favsFiltradas = filtrarSeriesAdultas(favs)
-                        seriesAdapter?.submitList(favsFiltradas)
-                        preLoadImages(favsFiltradas)
+                        seriesAdapter?.submitList(favs, aplicarRecentes = false)
                     }
                 }
                 override fun onFailure(call: Call<List<SeriesStream>>, t: Throwable) {
                     progressBar.visibility = View.GONE
-                    if (categoriaAtualId == "FAV_SERIES") seriesAdapter?.submitList(filtrarSeriesAdultas(listaNoCache))
+                    if (categoriaAtualId == "FAV_SERIES") seriesAdapter?.submitList(listaNoCache, aplicarRecentes = false)
                 }
             })
     }
@@ -639,10 +712,7 @@ class SeriesActivity : AppCompatActivity() {
     }
 
     // =========================================================================
-    // ADAPTER DE CATEGORIAS — chips estilo pill, com degradê vermelho quando
-    // selecionado e contorno sutil quando não selecionado. Foco de TV usa um
-    // contorno neon próprio (bg_chip_focused) e sempre restaura o estilo base
-    // correto (selecionado ou não) ao perder o foco.
+    // ADAPTER DE CATEGORIAS — chips estilo pill
     // =========================================================================
     inner class SeriesCategoryAdapter(
         private val list: List<LiveCategory>,
@@ -702,31 +772,49 @@ class SeriesActivity : AppCompatActivity() {
     }
 
     // =========================================================================
-    // ADAPTER DE SÉRIES — DiffUtil, sem placeholder, sem círculo
+    // ADAPTER DE SÉRIES — filtros + ordenação + DiffUtil em thread de fundo
     // =========================================================================
     inner class SeriesAdapter(
         private val onClick: (SeriesStream) -> Unit
     ) : RecyclerView.Adapter<SeriesAdapter.VH>() {
 
-        private val items = mutableListOf<SeriesStream>()
+        // Lista imutável, só trocada na thread principal.
+        private var items: List<SeriesStream> = emptyList()
 
-        // ✅ NOVO: toda lista enviada pro adapter é ordenada da série mais
-        // recente (ano maior) pra mais antiga, e o RecyclerView é reposicionado
-        // no topo — corrige tanto a ordem por ano quanto o bug de abrir a tela
-        // no meio/final da lista.
-        fun submitList(newList: List<SeriesStream>) {
-            val listaOrdenada = newList.sortedByDescending { extrairAnoSerie(it.name) }
-            val diff = DiffUtil.calculateDiff(object : DiffUtil.Callback() {
-                override fun getOldListSize() = items.size
-                override fun getNewListSize() = listaOrdenada.size
-                override fun areItemsTheSame(o: Int, n: Int) = items[o].id == listaOrdenada[n].id
-                override fun areContentsTheSame(o: Int, n: Int) =
-                    items[o].name == listaOrdenada[n].name && items[o].icon == listaOrdenada[n].icon
-            })
-            items.clear()
-            items.addAll(listaOrdenada)
-            diff.dispatchUpdatesTo(this)
-            rvSeries.scrollToPosition(0)
+        // Cada submitList ganha um número; só o mais recente é aplicado.
+        private var versaoSubmit = 0
+
+        // ✅ CORRIGIDO: o trabalho pesado (filtro adulto, filtro de recentes,
+        // ordenar por ano, calcular o diff) agora roda em Dispatchers.Default.
+        // Na thread principal só entra a aplicação do resultado.
+        // aplicarRecentes = false nos favoritos (mostram tudo).
+        // rolarTopo = false nas atualizações de fundo.
+        fun submitList(
+            novaLista: List<SeriesStream>,
+            aplicarRecentes: Boolean,
+            rolarTopo: Boolean = true
+        ) {
+            val versao = ++versaoSubmit
+            val antigos = items
+            lifecycleScope.launch(Dispatchers.Default) {
+                var base = filtrarSeriesAdultas(novaLista)
+                if (aplicarRecentes) base = filtrarRecentes(base)
+                val ordenada = ordenarPorAno(base)
+                val diff = DiffUtil.calculateDiff(object : DiffUtil.Callback() {
+                    override fun getOldListSize() = antigos.size
+                    override fun getNewListSize() = ordenada.size
+                    override fun areItemsTheSame(o: Int, n: Int) = antigos[o].id == ordenada[n].id
+                    override fun areContentsTheSame(o: Int, n: Int) =
+                        antigos[o].name == ordenada[n].name && antigos[o].icon == ordenada[n].icon
+                }, false)
+                withContext(Dispatchers.Main) {
+                    if (isFinishing || isDestroyed || versao != versaoSubmit) return@withContext
+                    items = ordenada
+                    diff.dispatchUpdatesTo(this@SeriesAdapter)
+                    if (rolarTopo) rvSeries.scrollToPosition(0)
+                    preLoadImages(ordenada)
+                }
+            }
         }
 
         inner class VH(v: View) : RecyclerView.ViewHolder(v) {
@@ -738,6 +826,13 @@ class SeriesActivity : AppCompatActivity() {
 
         override fun onCreateViewHolder(parent: ViewGroup, viewType: Int) =
             VH(LayoutInflater.from(parent.context).inflate(R.layout.item_vod, parent, false))
+
+        // Item saiu da tela → cancela a busca de logo que ainda não terminou.
+        override fun onViewRecycled(holder: VH) {
+            holder.job?.cancel()
+            holder.job = null
+            super.onViewRecycled(holder)
+        }
 
         override fun onBindViewHolder(holder: VH, position: Int) {
             holder.job?.cancel()
@@ -773,26 +868,40 @@ class SeriesActivity : AppCompatActivity() {
                     Glide.with(holder.itemView.context).load(diskCached)
                         .diskCacheStrategy(DiskCacheStrategy.ALL).dontAnimate().into(holder.imgLogo)
                 } else {
-                    // ✅ Corrigido: lifecycleScope em vez de CoroutineScope(Dispatchers.IO)
-                    // solta. Isso cancela automaticamente a busca de logo se a Activity
-                    // for destruída, evitando o crash "destroyed activity" no Glide.with().
-                    holder.job = lifecycleScope.launch(Dispatchers.IO) {
-                        val url = searchTmdbLogoSeries(item.name)
-                        if (url != null) {
-                            logoMemoryCache[item.name] = url
-                            seriesCachePrefs.edit().putString("logo_${item.name}", url).apply()
-                            withContext(Dispatchers.Main) {
-                                // ✅ Guard extra: nunca chama Glide se a Activity já
-                                // estiver finalizando/destruída (ex: usuário saiu da tela
-                                // enquanto a busca TMDB ainda estava em andamento).
-                                if (isFinishing || isDestroyed) return@withContext
-                                if (holder.adapterPosition == position) {
-                                    holder.tvName.visibility = View.GONE
-                                    holder.imgLogo.visibility = View.VISIBLE
-                                    Glide.with(holder.itemView.context).load(url)
-                                        .override(200, 110)
-                                        .diskCacheStrategy(DiskCacheStrategy.ALL)
-                                        .dontAnimate().into(holder.imgLogo)
+                    // ✅ Só busca se o TMDB não disse "sem logo" nos últimos 7 dias.
+                    val semLogoEm = seriesCachePrefs.getLong("semlogo_${item.name}", 0L)
+                    val deveBuscar = semLogoEm == 0L ||
+                        System.currentTimeMillis() - semLogoEm > SEM_LOGO_TTL_MS
+
+                    if (deveBuscar) {
+                        holder.job = lifecycleScope.launch(Dispatchers.IO) {
+                            // Espera um instante: se o item sair da tela
+                            // (rolagem rápida), o job é cancelado aqui e
+                            // nenhuma chamada de rede é feita.
+                            delay(250)
+                            // No máximo 3 buscas simultâneas.
+                            val url = logoSemaphore.withPermit { searchTmdbLogoSeries(item.name) }
+                            when {
+                                url == null -> { /* erro de rede: tenta de novo outra hora */ }
+                                url.isEmpty() -> seriesCachePrefs.edit()
+                                    .putLong("semlogo_${item.name}", System.currentTimeMillis())
+                                    .apply()
+                                else -> {
+                                    logoMemoryCache[item.name] = url
+                                    seriesCachePrefs.edit().putString("logo_${item.name}", url).apply()
+                                    withContext(Dispatchers.Main) {
+                                        if (isFinishing || isDestroyed) return@withContext
+                                        // Confere se esse mesmo item ainda está nessa posição.
+                                        val pos = holder.adapterPosition
+                                        if (pos != RecyclerView.NO_POSITION && items.getOrNull(pos)?.name == item.name) {
+                                            holder.tvName.visibility = View.GONE
+                                            holder.imgLogo.visibility = View.VISIBLE
+                                            Glide.with(holder.itemView.context).load(url)
+                                                .override(200, 110)
+                                                .diskCacheStrategy(DiskCacheStrategy.ALL)
+                                                .dontAnimate().into(holder.imgLogo)
+                                        }
+                                    }
                                 }
                             }
                         }
