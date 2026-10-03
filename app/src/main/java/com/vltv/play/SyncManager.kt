@@ -1,10 +1,7 @@
 package com.vltv.play
 
 import android.content.Context
-import android.os.Handler
-import android.os.Looper
 import android.util.Log
-import android.widget.Toast
 import com.vltv.play.data.AppDatabase
 import com.vltv.play.data.LiveStreamEntity
 import com.vltv.play.data.SeriesEntity
@@ -283,10 +280,10 @@ object SyncManager {
         val db = AppDatabase.getDatabase(context)
         val palavrasProibidas = listOf("XXX", "PORN", "ADULTO", "SEXO", "EROTICO", "🔞", "PORNÔ")
         val t0 = System.currentTimeMillis()
-        // ⚠️ DIAGNÓSTICO TEMPORÁRIO: junta os tempos de cada etapa da 1ª
-        // sincronização da sessão e mostra UM Toast no fim (ex.: "SYNC 45s
-        // | catalogo 0.3s | baixou 41s | home 44s ..."). Serve só pra
-        // descobrir qual etapa demora. Remover depois de achar a causa.
+        // DIAGNÓSTICO (silencioso): junta os tempos de cada etapa da 1ª
+        // sincronização da sessão e registra UMA linha no Logcat no fim (ex.:
+        // "SYNC: catalogo 0.3s | baixou 41s | home 44s ..."). Não aparece
+        // nada na tela do aplicativo.
         val primeiraDaSessao = !jaSincronizouNestaSessao
         val marcas = mutableListOf<String>()
         fun logTempo(etapa: String, rotulo: String? = null) {
@@ -553,14 +550,13 @@ object SyncManager {
             logTempo("FIM da sincronização (ContentRepository atualizado)", "FIM")
             notificarOuvintes()
 
+            // ✅ SILENCIOSO: antes aparecia um Toast "SYNC: ..." na tela do
+            // cliente. Agora o resumo dos tempos vai só pro Logcat (tag
+            // "SyncManager"), sem nada visível no aplicativo.
             if (primeiraDaSessao) {
                 val texto = "SYNC: " + marcas.joinToString(" | ") +
                     (if (aplicadoPeloBackend) " | Top10=backend" else " | Top10=local")
-                Handler(Looper.getMainLooper()).post {
-                    try {
-                        Toast.makeText(context.applicationContext, texto, Toast.LENGTH_LONG).show()
-                    } catch (e: Exception) { }
-                }
+                Log.d("SyncManager", texto)
             }
 
             // Canais ao vivo: só agora esperamos (já rodava em paralelo desde
