@@ -33,8 +33,6 @@ import com.vltv.play.data.VodEntity
 import com.vltv.play.databinding.ActivityLoginBinding
 import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.Channel
-import kotlinx.coroutines.sync.Semaphore
-import kotlinx.coroutines.sync.withPermit
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import org.json.JSONArray
@@ -528,19 +526,24 @@ class LoginActivity : AppCompatActivity() {
             var dnsVencedor: String? = null
 
             try {
-                // ✅ CORREÇÃO: em vez de testar TODOS os DNS de uma vez,
-                // testa em 2 rodadas. 1ª: só 1 DNS de cada painel
-                // (lâmina), todos em paralelo — rápido e sem estourar o
-                // limite dos painéis (429/403). 2ª (só se a 1ª não achou
-                // ninguém): os DNS irmãos, no máx. 6 ao mesmo tempo.
-                dnsVencedor = testarGrupoEmParalelo(
-                    DnsConfig.primeiraRodada(), user, pass, 9, 15_000L
-                )
-                if (dnsVencedor == null && !contaExpiradaDetectada) {
-                    dnsVencedor = testarGrupoEmParalelo(
-                        DnsConfig.segundaRodada(), user, pass, 6, 15_000L
-                    )
+                val canal = Channel<String>(Channel.UNLIMITED)
+                val jobs = SERVERS.map { url ->
+                    launch(Dispatchers.IO) {
+                        val r = testarServidor(url, user, pass, clientRapido)
+                        if (r != null) canal.trySend(r)
+                    }
                 }
+                // ✅ CORREÇÃO: polling em fatias de 300ms em vez de esperar
+                // o teto de 18s inteiro, saindo assim que a expiração é
+                // confirmada.
+                val inicioEspera = System.currentTimeMillis()
+                while (System.currentTimeMillis() - inicioEspera < 18_000L) {
+                    val recebido = withTimeoutOrNull(300L) { canal.receive() }
+                    if (recebido != null) { dnsVencedor = recebido; break }
+                    if (contaExpiradaDetectada) break
+                }
+                jobs.forEach { it.cancel() }
+                canal.close()
             } catch (e: Exception) {
                 e.printStackTrace()
             }
@@ -553,11 +556,7 @@ class LoginActivity : AppCompatActivity() {
             // ✅ Se algum servidor já confirmou que a conta expirou, pula
             // o fallback — não adianta insistir.
             if (dnsVencedor == null && !contaExpiradaDetectada) {
-                // ✅ CORREÇÃO: teto de 30s no total. Antes eram até ~24
-                // servidores em fila, cada um podendo gastar 25s+25s.
-                val fimFallback = System.currentTimeMillis() + 30_000L
                 for (servidor in SERVERS) {
-                    if (System.currentTimeMillis() > fimFallback) break
                     // ✅ CORREÇÃO: sai do loop assim que a expiração é
                     // confirmada, em vez de continuar testando os servidores
                     // restantes à toa.
@@ -616,112 +615,62 @@ class LoginActivity : AppCompatActivity() {
         }
     }
 
-    // ✅ NOVO: testa uma lista de DNS em paralelo (no máximo
-    // maxSimultaneos ao mesmo tempo). Devolve o primeiro que responder
-    // com login válido, ou null se ninguém respondeu, se a conta foi
-    // detectada como expirada, ou se estourou o teto de tempo. Sai assim
-    // que todos terminam (não espera o teto à toa).
-    private suspend fun CoroutineScope.testarGrupoEmParalelo(
-        lista: List<String>, user: String, pass: String,
-        maxSimultaneos: Int, tetoMs: Long
-    ): String? {
-        if (lista.isEmpty()) return null
-        val canal = Channel<String>(Channel.UNLIMITED)
-        val limite = Semaphore(maxSimultaneos)
-        val jobs = lista.map { url ->
-            launch(Dispatchers.IO) {
-                limite.withPermit {
-                    val r = testarServidor(url, user, pass, clientRapido)
-                    if (r != null) canal.trySend(r)
-                }
-            }
-        }
-        var vencedor: String? = null
-        val inicio = System.currentTimeMillis()
-        while (System.currentTimeMillis() - inicio < tetoMs) {
-            val recebido = withTimeoutOrNull(300L) { canal.receive() }
-            if (recebido != null) { vencedor = recebido; break }
-            if (contaExpiradaDetectada) break
-            if (jobs.all { it.isCompleted }) {
-                vencedor = canal.tryReceive().getOrNull()
-                break
-            }
-        }
-        jobs.forEach { it.cancel() }
-        canal.close()
-        return vencedor
-    }
-
     private fun testarServidor(baseUrl: String, user: String, pass: String, httpClient: OkHttpClient): String? {
         val urlBase = normalizarBaseUrl(baseUrl)
         val urlSemBarra = urlBase.removeSuffix("/")
-        val host = try { java.net.URI(urlSemBarra).host ?: urlSemBarra } catch (e: Exception) { urlSemBarra }
+        return try {
+            val request = Request.Builder()
+                .url("$urlSemBarra/player_api.php?username=$user&password=$pass")
+                // ✅ CORREÇÃO: UA completo (com AppleWebKit/Chrome/Safari) —
+                // o UA anterior era um navegador incompleto, que o nginx de
+                // supertv.red/sivimcdn.click rejeitava com 403 "Access
+                // denied" por não bater no padrão de UA aceito.
+                .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
+                .header("Accept-Language", "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7")
+                .build()
 
-        // ✅ NOVO: tenta o User-Agent preferido desse painel (Chrome por
-        // padrão) e, se o painel responder 403/406, tenta o outro (UA de
-        // player). O que funcionar fica gravado pra esse domínio.
-        val uas = UaHelper.ordemParaHost(host)
-        var ultimoCodigo = -1
+            httpClient.newCall(request).execute().use { response ->
+                if (response.isSuccessful) {
+                    val body = response.body?.string() ?: ""
 
-        for (ua in uas) {
-            val resultado: String? = try {
-                val request = Request.Builder()
-                    .url("$urlSemBarra/player_api.php?username=$user&password=$pass")
-                    .header("User-Agent", ua)
-                    .header("Accept-Language", "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7")
-                    .build()
-
-                httpClient.newCall(request).execute().use { response ->
-                    ultimoCodigo = response.code
-                    if (response.isSuccessful) {
-                        val body = response.body?.string() ?: ""
-
-                        // Registra quando o servidor responde que a conta
-                        // existe (auth diferente de 0) mas está
-                        // Expired/Disabled — pra avisar o usuário.
-                        val temUserInfo = body.contains("user_info") && body.contains("server_info")
-                        val authZero = Regex("\"auth\"\\s*:\\s*\"?0\"?").containsMatchIn(body)
-                        val bloqueadaNoServidor = Regex(
-                            "\"status\"\\s*:\\s*\"(Expired|Disabled)\"",
+                    // ✅ NOVO: registra quando o servidor responde que a
+                    // conta existe (auth diferente de 0) mas está
+                    // Expired/Disabled. A conta continua sendo rejeitada
+                    // abaixo (retorna null), mas quem chamou agora sabe
+                    // que o motivo foi expiração e pode avisar o usuário.
+                    val temUserInfo = body.contains("user_info") && body.contains("server_info")
+                    val authZero = Regex("\"auth\"\\s*:\\s*\"?0\"?").containsMatchIn(body)
+                    val bloqueadaNoServidor = Regex(
+                        "\"status\"\\s*:\\s*\"(Expired|Disabled)\"",
+                        RegexOption.IGNORE_CASE
+                    ).containsMatchIn(body)
+                    if (temUserInfo && !authZero && bloqueadaNoServidor) {
+                        contaExpiradaEhTeste = Regex(
+                            "\"is_trial\"\\s*:\\s*\"?(1|true)\"?",
                             RegexOption.IGNORE_CASE
                         ).containsMatchIn(body)
-                        if (temUserInfo && !authZero && bloqueadaNoServidor) {
-                            contaExpiradaEhTeste = Regex(
-                                "\"is_trial\"\\s*:\\s*\"?(1|true)\"?",
-                                RegexOption.IGNORE_CASE
-                            ).containsMatchIn(body)
-                            contaExpiradaDetectada = true
-                        }
+                        contaExpiradaDetectada = true
+                    }
 
-                        val valido = body.contains("user_info") &&
-                                body.contains("server_info") &&
-                                !body.contains("\"auth\":0") &&
-                                !body.contains("\"auth\": 0") &&
-                                !body.contains("\"auth\":\"0\"") &&
-                                !body.contains("\"status\":\"Disabled\"") &&
-                                !body.contains("\"status\":\"Expired\"")
-                        if (valido) urlBase else null
+                    val valido = body.contains("user_info") &&
+                            body.contains("server_info") &&
+                            !body.contains("\"auth\":0") &&
+                            !body.contains("\"auth\": 0") &&
+                            !body.contains("\"auth\":\"0\"") &&
+                            !body.contains("\"status\":\"Disabled\"") &&
+                            !body.contains("\"status\":\"Expired\"")
+                    if (valido) {
+                        urlBase
                     } else {
                         null
                     }
+                } else {
+                    null
                 }
-            } catch (e: Exception) {
-                // Erro de rede (DNS, timeout, conexão): trocar o UA não
-                // adianta — desiste desse DNS.
-                return null
             }
-
-            if (resultado != null) {
-                UaHelper.lembrar(host, ua)
-                return resultado
-            }
-            // 403/406 = provável bloqueio de User-Agent → tenta o próximo UA
-            if (ultimoCodigo == 403 || ultimoCodigo == 406) continue
-
-            return null
+        } catch (e: Exception) {
+            null
         }
-
-        return null
     }
 
     private suspend fun preCarregarLoteMinimo(dns: String, user: String, pass: String) {
@@ -846,7 +795,7 @@ class LoginActivity : AppCompatActivity() {
                 connectTimeout = 10_000
                 readTimeout    = 12_000
                 requestMethod  = "GET"
-                setRequestProperty("User-Agent", UaHelper.paraHost(try { java.net.URL(url).host } catch (e: Exception) { "" }))
+                setRequestProperty("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
                 setRequestProperty("Accept", "application/json")
                 setRequestProperty("Accept-Language", "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7")
             }
