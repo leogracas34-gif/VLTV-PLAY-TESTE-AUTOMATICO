@@ -117,7 +117,9 @@ class PlayerActivity : AppCompatActivity() {
     private val extensoesTentativa = mutableListOf<String>()
     private var extIndex = 0
 
-    private val USER_AGENT = "IPTVSmartersPro"
+    // ✅ CENTRALIZADO: o User-Agent agora vem de NetworkConfig, o mesmo
+    // valor usado em todas as telas.
+    private val USER_AGENT = NetworkConfig.USER_AGENT
 
     private val database by lazy { AppDatabase.getDatabase(this) }
 
@@ -360,8 +362,11 @@ class PlayerActivity : AppCompatActivity() {
             extensoesTentativa.add("mp4")
             extensoesTentativa.add("mkv")
         } else {
-            extensoesTentativa.add("m3u8")
+            // ✅ OTIMIZADO: "ts" primeiro. O .ts direto abre mais rápido
+            // que o .m3u8 (que precisa baixar a playlist e depois os
+            // segmentos) — e é a mesma ordem usada na LiveTvActivity.
             extensoesTentativa.add("ts")
+            extensoesTentativa.add("m3u8")
             extensoesTentativa.add("")
         }
 
@@ -979,16 +984,19 @@ class PlayerActivity : AppCompatActivity() {
         val dataSourceFactory = DefaultHttpDataSource.Factory()
             .setUserAgent(USER_AGENT)
             .setAllowCrossProtocolRedirects(true)
-            .setConnectTimeoutMs(12000)
-            .setReadTimeoutMs(15000)
+            .setConnectTimeoutMs(NetworkConfig.CONNECT_TIMEOUT_MS)
+            .setReadTimeoutMs(NetworkConfig.READ_TIMEOUT_MS)
 
         val mediaSourceFactory = DefaultMediaSourceFactory(dataSourceFactory)
 
         val isLive         = streamType == "live"
         val minBufferMs    = 2000
-        val maxBufferMs    = if (isLive) 5000 else 60000  // VOD: 60s de buffer (era 15s)
+        // ✅ OTIMIZADO: live com até 15s de buffer (era 5s) — o início
+        // continua rápido (playBufferMs = 1s), mas a reprodução aguenta
+        // melhor oscilações de rede sem travar.
+        val maxBufferMs    = if (isLive) 15000 else 60000
         val playBufferMs   = 1000
-        val playRebufferMs = 2000
+        val playRebufferMs = if (isLive) 2500 else 2000
 
         val loadControl = androidx.media3.exoplayer.DefaultLoadControl.Builder()
             .setBufferDurationsMs(minBufferMs, maxBufferMs, playBufferMs, playRebufferMs)
