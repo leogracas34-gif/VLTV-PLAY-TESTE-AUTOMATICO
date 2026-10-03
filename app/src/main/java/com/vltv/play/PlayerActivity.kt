@@ -11,7 +11,6 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
-import android.os.SystemClock
 import android.util.Base64
 import android.util.Log
 import android.util.Rational
@@ -118,50 +117,16 @@ class PlayerActivity : AppCompatActivity() {
     private val extensoesTentativa = mutableListOf<String>()
     private var extIndex = 0
 
-    // ⚠️ VERSÃO DE TESTE: antes era "IPTVSmartersPro". Agora usa o MESMO
-    // User-Agent de navegador que o resto do app já usa nas chamadas da API
-    // (VpnInterceptor) — alguns servidores/CDNs recusam o vídeo só pro UA
-    // "IPTVSmartersPro" mesmo aceitando o login.
-    private val USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-
-    // ⚠️ DIAGNÓSTICO TEMPORÁRIO (ver mostrarDiagErro): REMOVER antes de publicar.
-    private var diagErros = 0
-    private var urlAtualDiag = ""
+    private val USER_AGENT = "IPTVSmartersPro"
 
     private val database by lazy { AppDatabase.getDatabase(this) }
 
     private val handler = Handler(Looper.getMainLooper())
 
-    // Botão "Próximo episódio" (ver nextChecker). Antes aparecia por
-    // PORCENTAGEM (98,5%), o que dava tempos diferentes conforme a duração
-    // do episódio. Agora aparece por SEGUNDOS RESTANTES:
-    //  - sem dado da VPS pra essa série: faltando CREDITOS_PADRAO_SEG (50s);
-    //  - com dado: ANTECEDENCIA_SEG (10s) antes do ponto em que os créditos
-    //    começam, aprendido com os outros clientes e guardado na VPS.
+    // Countdown de 35s para proximo episodio
     private var countdownAtivo = false
-    private var countdownSegundos = CREDITOS_PADRAO_SEG
+    private var countdownSegundos = 55
     private var nextEpisodeLaunched = false
-
-    // ═══════════════════════════════════════════════════════════════
-    //  CRÉDITOS APRENDIDOS (guardados na VPS, /credits)
-    // ═══════════════════════════════════════════════════════════════
-    // Quantos segundos faltavam pro fim do episódio quando os créditos
-    // começam nessa série. null = ninguém ensinou ainda (usa o padrão).
-    private var creditosRestantesSeg: Int? = null
-
-    // Identidade da série no backend. O PlayerActivity só recebe o id do
-    // EPISÓDIO, mas a mochila (episode_list) cobre a série inteira em
-    // ordem — então o id do 1º episódio dela é uma chave estável por
-    // série, e não precisou mexer em nenhuma outra tela. 0 = não se aplica
-    // (filme, canal ao vivo ou episódio baixado).
-    private var serieChaveCreditos = 0
-
-    // Momento (elapsedRealtime) em que o botão apareceu — usado pra só
-    // aprender com o toque de quem ESPEROU o botão (ver aprenderPontoCreditos).
-    private var botaoVisivelDesdeMs = 0L
-
-    // Garante um único envio por execução do player.
-    private var creditosEnviados = false
 
     // ═══════════════════════════════════════════════════════════════
     //  PREVIEW DE MINIATURA (SCRUBBING) — estilo Netflix
@@ -236,143 +201,42 @@ class PlayerActivity : AppCompatActivity() {
                 return
             }
 
-            // ✅ NOVO: decide por SEGUNDOS RESTANTES (não mais por % do
-            // episódio) — ver limiarBotaoSeg().
-            val restanteSeg = ((dur - pos) / 1000L).toInt()
+            val progress = pos.toFloat() / dur.toFloat()
 
-            if (restanteSeg <= limiarBotaoSeg()) {
+            // 98.5% = countdown aparece quando faltam ~38s + 35s em ep de 42min
+            if (progress >= 0.985f) {
                 if (!countdownAtivo) {
-                    countdownAtivo = true
-                    // calcula e exibe (se for o caso) o aviso de fim de
-                    // temporada assim que o botão começa a aparecer — não
-                    // precisa recalcular a cada tick.
+                    countdownAtivo    = true
+                    countdownSegundos = 50
+                    // ✅ NOVO: calcula e exibe (se for o caso) o aviso de
+                    // fim de temporada assim que o countdown começa —
+                    // não precisa recalcular a cada tick.
                     atualizarAvisoTemporada()
                 }
 
-                // O número mostrado agora é o tempo REAL que falta pro
-                // episódio acabar (antes era um contador de 50s que nunca
-                // chegava a zero porque o episódio terminava antes).
-                countdownSegundos = restanteSeg.coerceAtLeast(0)
-                // Com créditos longos o botão pode aparecer com vários
-                // minutos faltando — mostra m:ss em vez de "430s".
-                tvNextEpisodeTitle.text = if (countdownSegundos > 60) {
-                    "Próximo episódio em ${countdownSegundos / 60}:${"%02d".format(countdownSegundos % 60)}"
-                } else {
-                    "Próximo episódio em ${countdownSegundos}s"
-                }
+                tvNextEpisodeTitle.text = "Próximo episódio em ${countdownSegundos}s"
 
                 if (nextEpisodeContainer.visibility != View.VISIBLE) {
                     nextEpisodeContainer.visibility = View.VISIBLE
-                    botaoVisivelDesdeMs = SystemClock.elapsedRealtime()
                     btnPlayNextEpisode.requestFocus()
                 }
 
-                if (restanteSeg <= 0) {
+                if (countdownSegundos <= 0) {
                     nextEpisodeContainer.visibility = View.GONE
                     tvSeasonEndWarning.visibility = View.GONE
                     abrirProximoEpisodio()
                     return
                 }
 
+                countdownSegundos--
                 handler.postDelayed(this, 1000L)
             } else {
                 nextEpisodeContainer.visibility = View.GONE
                 tvSeasonEndWarning.visibility = View.GONE
                 countdownAtivo    = false
-                countdownSegundos = CREDITOS_PADRAO_SEG
-                botaoVisivelDesdeMs = 0L
+                countdownSegundos = 35
                 handler.postDelayed(this, 1000L)
             }
-        }
-    }
-
-    // ═══════════════════════════════════════════════════════════════
-    //  CRÉDITOS APRENDIDOS — implementação
-    // ═══════════════════════════════════════════════════════════════
-
-    // Com quantos segundos restantes o botão deve aparecer agora.
-    private fun limiarBotaoSeg(): Int {
-        val aprendido = creditosRestantesSeg ?: return CREDITOS_PADRAO_SEG
-        return aprendido + ANTECEDENCIA_SEG
-    }
-
-    // Chamado uma vez no onCreate. Só vale pra série ONLINE: episódio
-    // baixado tem a mochila só com o que foi baixado (a chave mudaria) e
-    // muitas vezes está sem internet — usa o padrão de 50s.
-    private fun iniciarCreditosAprendidos() {
-        if (streamType != "series") return
-        serieChaveCreditos = episodeList.firstOrNull() ?: 0
-        if (serieChaveCreditos == 0) return
-
-        val prefs = getSharedPreferences("vltv_prefs", Context.MODE_PRIVATE)
-        val dns = prefs.getString("dns", "") ?: ""
-        val chavePref = "creditos_seg_$serieChaveCreditos"
-
-        // 1) Cópia local (instantânea): vale pro episódio seguinte da
-        //    mesma série já abrir com o botão no lugar certo, mesmo sem rede.
-        val local = prefs.getInt(chavePref, -1)
-        if (local in CREDITOS_MIN_SEG..CREDITOS_MAX_SEG) creditosRestantesSeg = local
-
-        // 2) VPS (em segundo plano): o valor do backend é a MEDIANA das
-        //    marcações de todos os clientes, então sobrescreve a cópia local.
-        if (dns.isBlank()) return
-        val chave = serieChaveCreditos
-        lifecycleScope.launch {
-            val daVps = HomeApiClient.buscarCreditos(dns, chave) ?: return@launch
-            if (daVps in CREDITOS_MIN_SEG..CREDITOS_MAX_SEG) {
-                creditosRestantesSeg = daVps
-                prefs.edit().putInt(chavePref, daVps).apply()
-            }
-        }
-    }
-
-    // Aprende o ponto dos créditos com um SINAL CONFIÁVEL do cliente:
-    //  - toque no botão "Próximo episódio" (toqueNoBotao = true): só vale
-    //    se o botão já estava na tela há 6s ou mais. Quem toca no mesmo
-    //    instante em que o botão aparece está só reagindo a ele, não
-    //    mostrando onde os créditos começam — e aprender isso faria o
-    //    botão aparecer 10s mais cedo a cada episódio.
-    //  - sair pelo "voltar" na reta final (75%+ assistido, 20s a 10min restantes).
-    // NÃO aprende com home/tela apagada/PiP (onStop), nem quando o próximo
-    // episódio abre sozinho (o cliente não escolheu nada).
-    private fun aprenderPontoCreditos(toqueNoBotao: Boolean) {
-        if (streamType != "series" || serieChaveCreditos == 0) return
-        if (creditosEnviados || nextEpisodeLaunched) return
-        val p = player ?: return
-        val dur = p.duration
-        val pos = p.currentPosition
-        if (dur <= 0 || pos < 0) return
-
-        val restanteSeg = ((dur - pos) / 1000L).toInt()
-        if (toqueNoBotao) {
-            val esperou = botaoVisivelDesdeMs != 0L &&
-                SystemClock.elapsedRealtime() - botaoVisivelDesdeMs >= 6_000L
-            if (!esperou) return
-        } else {
-            // Saída pelo "voltar": só conta se já estava na reta final do
-            // episódio (75% ou mais assistido) e dentro da faixa aceita.
-            // A trava dos 75% evita aprender com quem desistiu no meio do
-            // episódio — sem ela, fechar aos 20min de um episódio de 1h
-            // marcaria "40 min restantes" como ponto dos créditos.
-            val progresso = pos.toFloat() / dur.toFloat()
-            if (restanteSeg !in 20..CREDITOS_MAX_SEG || progresso < 0.75f) return
-        }
-        if (restanteSeg !in CREDITOS_MIN_SEG..CREDITOS_MAX_SEG) return
-
-        creditosEnviados = true
-        creditosRestantesSeg = restanteSeg
-
-        val prefs = getSharedPreferences("vltv_prefs", Context.MODE_PRIVATE)
-        prefs.edit().putInt("creditos_seg_$serieChaveCreditos", restanteSeg).apply()
-
-        // historicoScope (e não lifecycleScope): sobrevive ao fechamento
-        // da tela — no "voltar" a Activity morre em milissegundos e o
-        // lifecycleScope cancelaria o envio no meio. Mesmo padrão já usado
-        // pra gravar o histórico.
-        val dns = prefs.getString("dns", "") ?: ""
-        val chave = serieChaveCreditos
-        if (dns.isNotBlank()) {
-            historicoScope.launch { HomeApiClient.enviarCreditos(dns, chave, restanteSeg) }
         }
     }
 
@@ -438,7 +302,6 @@ class PlayerActivity : AppCompatActivity() {
         if (listaExts != null) episodeExts = listaExts
 
         calcularProximoEpisodioAutomaticamente()
-        iniciarCreditosAprendidos()
 
         // ✅ NOVO: offlineUri agora é o "content ID" do Media3 (gravado em
         // DownloadEntity.file_path), e offlineUrl é a URL original usada
@@ -485,7 +348,6 @@ class PlayerActivity : AppCompatActivity() {
 
         btnPlayNextEpisode.setOnClickListener {
             if (nextStreamId != 0) {
-                aprenderPontoCreditos(toqueNoBotao = true)
                 abrirProximoEpisodio()
             } else {
                 Toast.makeText(this, "Sem proximo episodio", Toast.LENGTH_SHORT).show()
@@ -1106,7 +968,6 @@ class PlayerActivity : AppCompatActivity() {
             id         = streamId,
             ext        = currentExt
         )
-        urlAtualDiag = url
 
         liberarPlayerGlobalDeOutraInstancia()
         player?.release()
@@ -1188,26 +1049,10 @@ class PlayerActivity : AppCompatActivity() {
             }
 
             override fun onPlayerError(error: PlaybackException) {
-                mostrarDiagErro(error)
                 loading.visibility = View.VISIBLE
                 handler.postDelayed({ tentarProximo() }, 1000L)
             }
         })
-    }
-
-    // ⚠️ DIAGNÓSTICO TEMPORÁRIO (versão de teste): mostra o motivo real da
-    // falha do vídeo (ex.: "Response code: 404", "UnknownHostException",
-    // "SocketTimeoutException"). Só as 3 primeiras falhas de cada abertura
-    // da tela. REMOVER antes de publicar pros clientes.
-    private fun mostrarDiagErro(error: PlaybackException) {
-        if (diagErros >= 3) return
-        diagErros++
-        val causa = error.cause
-        val host = try { Uri.parse(urlAtualDiag).host } catch (e: Exception) { null } ?: "?"
-        val ext = extensoesTentativa.getOrElse(extIndex) { "?" }
-        val detalhe = "${error.errorCodeName} | ${causa?.javaClass?.simpleName ?: "-"}: ${causa?.message ?: ""}"
-        Log.e("VLTV_DIAG", "player .$ext @ $host -> $detalhe")
-        Toast.makeText(this, "DIAG .$ext @ $host\n$detalhe", Toast.LENGTH_LONG).show()
     }
 
     private fun tentarProximo() {
@@ -1231,7 +1076,6 @@ class PlayerActivity : AppCompatActivity() {
         handler.removeCallbacks(nextChecker)
         nextEpisodeContainer.visibility = View.GONE
         tvSeasonEndWarning.visibility = View.GONE
-        botaoVisivelDesdeMs = 0L
 
         if (activePlayer === player) activePlayer = null
         player?.stop()
@@ -1542,7 +1386,7 @@ class PlayerActivity : AppCompatActivity() {
     }
 
     override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
-        if (keyCode == KeyEvent.KEYCODE_BACK) { aprenderPontoCreditos(toqueNoBotao = false); finish(); return true }
+        if (keyCode == KeyEvent.KEYCODE_BACK) { finish(); return true }
         return super.onKeyDown(keyCode, event)
     }
 
@@ -1647,7 +1491,6 @@ class PlayerActivity : AppCompatActivity() {
 
     @Suppress("DEPRECATION")
     override fun onBackPressed() {
-        aprenderPontoCreditos(toqueNoBotao = false)
         if (activePlayer === player) activePlayer = null
         player?.stop()
         player?.release()
@@ -1672,18 +1515,5 @@ class PlayerActivity : AppCompatActivity() {
         // pertença a uma instância diferente da sua.
         @Volatile
         private var activePlayer: ExoPlayer? = null
-
-        // ✅ NOVO: botão "Próximo episódio" — segundos restantes em que
-        // ele aparece quando a VPS ainda não sabe onde os créditos dessa
-        // série começam.
-        private const val CREDITOS_PADRAO_SEG = 50
-
-        // Quantos segundos ANTES do ponto aprendido o botão aparece.
-        private const val ANTECEDENCIA_SEG = 10
-
-        // Faixa aceita pro ponto dos créditos (mesma validação do backend:
-        // 10s a 10min — há séries com créditos bem longos).
-        private const val CREDITOS_MIN_SEG = 10
-        private const val CREDITOS_MAX_SEG = 600
     }
 }
