@@ -519,7 +519,6 @@ class LoginActivity : AppCompatActivity() {
         lifecycleScope.launch(Dispatchers.IO) {
             contaExpiradaDetectada = false
             contaExpiradaEhTeste = false
-            diagnostico.clear()
 
             // ✅ NOVO: garante a lista de DNS mais recente da VPS antes de
             // testar os servidores (não baixa de novo se já baixou há
@@ -610,7 +609,7 @@ class LoginActivity : AppCompatActivity() {
                     if (expirada) {
                         abrirTelaExpirado(ehTeste)
                     } else {
-                        mostrarFalhaComDiagnostico()
+                        mostrarErro("Servidor não encontrado. Verifique login e senha.")
                     }
                 }
             }
@@ -651,19 +650,6 @@ class LoginActivity : AppCompatActivity() {
         jobs.forEach { it.cancel() }
         canal.close()
         return vencedor
-    }
-
-    // ✅ NOVO: resultado do teste de cada DNS (host -> causa), pra mostrar
-    // na tela quando o login falha em todos. "login recusado" = o painel
-    // respondeu normalmente, só que o usuário não é daquele painel.
-    private val diagnostico = java.util.concurrent.ConcurrentHashMap<String, String>()
-
-    private fun causaDaExcecao(e: Exception): String = when (e) {
-        is java.net.UnknownHostException -> "DNS não resolveu"
-        is java.net.SocketTimeoutException -> "tempo esgotado"
-        is java.net.ConnectException -> "conexão recusada"
-        is javax.net.ssl.SSLException -> "erro SSL/HTTPS"
-        else -> e.javaClass.simpleName
     }
 
     private fun testarServidor(baseUrl: String, user: String, pass: String, httpClient: OkHttpClient): String? {
@@ -721,25 +707,20 @@ class LoginActivity : AppCompatActivity() {
                 }
             } catch (e: Exception) {
                 // Erro de rede (DNS, timeout, conexão): trocar o UA não
-                // adianta — registra a causa e desiste desse DNS.
-                diagnostico[host] = causaDaExcecao(e)
+                // adianta — desiste desse DNS.
                 return null
             }
 
             if (resultado != null) {
                 UaHelper.lembrar(host, ua)
-                diagnostico[host] = "ok"
                 return resultado
             }
             // 403/406 = provável bloqueio de User-Agent → tenta o próximo UA
             if (ultimoCodigo == 403 || ultimoCodigo == 406) continue
 
-            diagnostico[host] =
-                if (ultimoCodigo in 200..299) "login recusado" else "HTTP $ultimoCodigo"
             return null
         }
 
-        diagnostico[host] = "HTTP $ultimoCodigo (acesso negado)"
         return null
     }
 
@@ -971,30 +952,6 @@ class LoginActivity : AppCompatActivity() {
         intent.flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK
         startActivity(intent)
         finish()
-    }
-
-    // ✅ NOVO: em vez de só "Servidor não encontrado", mostra por que cada
-    // DNS falhou (DNS não resolveu, tempo esgotado, HTTP 403...). Painéis
-    // que só responderam "login recusado" não entram na lista — isso é
-    // normal (o usuário não pertence àquele painel).
-    private fun mostrarFalhaComDiagnostico() {
-        val problemas = diagnostico.entries
-            .filter { it.value != "login recusado" && it.value != "ok" }
-            .sortedBy { it.key }
-        val texto = StringBuilder("Servidor não encontrado. Verifique login e senha.")
-        if (problemas.isNotEmpty()) {
-            texto.append("\n\nProblemas de conexão:")
-            problemas.forEach { texto.append("\n• ${it.key}: ${it.value}") }
-        }
-        try {
-            androidx.appcompat.app.AlertDialog.Builder(this)
-                .setTitle("Não foi possível entrar")
-                .setMessage(texto.toString())
-                .setPositiveButton("OK", null)
-                .show()
-        } catch (e: Exception) {
-            mostrarErro("Servidor não encontrado. Verifique login e senha.")
-        }
     }
 
     private fun mostrarErro(msg: String) {
