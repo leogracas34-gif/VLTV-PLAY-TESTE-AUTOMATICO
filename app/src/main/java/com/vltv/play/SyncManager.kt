@@ -1,11 +1,15 @@
 package com.vltv.play
 
 import android.content.Context
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
+import android.widget.Toast
 import com.vltv.play.data.AppDatabase
 import com.vltv.play.data.LiveStreamEntity
 import com.vltv.play.data.SeriesEntity
 import com.vltv.play.data.VodEntity
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -95,6 +99,17 @@ object SyncManager {
 
     // ── Sync periódica leve ───────────────────────────────────────────────────
     private val PERIODIC_INTERVAL_MS = 10 * 60 * 1000L // 10 minutos
+
+    // ✅ NOVO: o download COMPLETO do catálogo (get_vod_streams +
+    // get_series + canais ao vivo = dezenas de milhares de itens) agora só
+    // acontece de novo depois desta janela, ou quando o banco está vazio,
+    // ou quando o usuário força ("Atualizar" nas configurações). Antes
+    // rodava em TODA abertura do app e a cada 10 minutos, o que deixava a
+    // Home lenta em painel/rede lentos e martelava os painéis (que podem
+    // banir o IP por excesso de requisições pesadas). Dentro da janela, a
+    // sincronização continua rodando a parte LEVE (Top10/Novidades/selos
+    // do backend).
+    private const val JANELA_SYNC_COMPLETA_MS = 3 * 60 * 60 * 1000L // 3 horas
 
     @Volatile
     private var periodicJob: Job? = null
@@ -244,7 +259,7 @@ object SyncManager {
                 if (dns.isEmpty() || user.isEmpty()) return@withLock
 
                 try {
-                    executarSincronizacao(context, dns, user, pass)
+                    executarSincronizacao(context, dns, user, pass, forcar = true)
                 } finally {
                     jaSincronizouNestaSessao = true
                     notificarOuvintes()
@@ -263,13 +278,21 @@ object SyncManager {
         ouvintesNovidade.clear()
     }
 
-    private suspend fun executarSincronizacao(context: Context, dnsRaw: String, user: String, pass: String) {
+    private suspend fun executarSincronizacao(context: Context, dnsRaw: String, user: String, pass: String, forcar: Boolean = false) {
         val dns = dnsRaw
         val db = AppDatabase.getDatabase(context)
         val palavrasProibidas = listOf("XXX", "PORN", "ADULTO", "SEXO", "EROTICO", "🔞", "PORNÔ")
         val t0 = System.currentTimeMillis()
-        fun logTempo(etapa: String) {
-            Log.d("SyncManager", "⏱ $etapa: ${System.currentTimeMillis() - t0}ms desde o início da sincronização")
+        // ⚠️ DIAGNÓSTICO TEMPORÁRIO: junta os tempos de cada etapa da 1ª
+        // sincronização da sessão e mostra UM Toast no fim (ex.: "SYNC 45s
+        // | catalogo 0.3s | baixou 41s | home 44s ..."). Serve só pra
+        // descobrir qual etapa demora. Remover depois de achar a causa.
+        val primeiraDaSessao = !jaSincronizouNestaSessao
+        val marcas = mutableListOf<String>()
+        fun logTempo(etapa: String, rotulo: String? = null) {
+            val ms = System.currentTimeMillis() - t0
+            Log.d("SyncManager", "⏱ $etapa: ${ms}ms desde o início da sincronização")
+            if (rotulo != null) marcas.add("$rotulo ${"%.1f".format(ms / 1000.0)}s")
         }
 
         // ✅ NOVO: a lista de canais AO VIVO roda em paralelo, mas FORA do
@@ -321,7 +344,7 @@ object SyncManager {
                     e.printStackTrace()
                 }
             }
-            logTempo("buscarCatalogo (catálogo pronto do backend, só quando local está vazio)")
+            logTempo("buscarCatalogo (catálogo pronto do backend, só quando local está vazio)", if (catalogoBackend != null) "catalogo-backend" else "catalogo-sem-backend")
 
             // ✅ CORREÇÃO (demora de 1-2 min pra aparecer o catálogo
             // correto na 1ª instalação): VOD, Séries e Live eram buscados
@@ -350,24 +373,76 @@ object SyncManager {
             //  2) Assim que filmes e séries estão gravados, a Home é
             //     avisada NA HORA (as 3 fileiras leem exatamente isso).
             //  3) Só no fim esperamos o Live terminar.
-            liveJob = scope.async { sincronizarLive(db, dns, user, pass) }
+            val prefsEstado = context.getSharedPreferences("vltv_sync_state", Context.MODE_PRIVATE)
+            val chaveUltimaCompleta = "ultima_sync_completa_" + user
+            val ultimaCompleta = prefsEstado.getLong(chaveUltimaCompleta, 0L)
+            val pularDownloadCompleto = !forcar &&
+                catalogoBackend == null &&
+                vodsExistentes.isNotEmpty() && seriesExistentes.isNotEmpty() &&
+                System.currentTimeMillis() - ultimaCompleta in 0L until JANELA_SYNC_COMPLETA_MS
 
-            coroutineScope {
-                val vodJob = async {
-                    val vodArray = catalogoBackend?.vodArray
-                        ?: buscarArrayXtream(dns, user, pass, "get_vod_streams")
-                    sincronizarVod(db, vodArray, palavrasProibidas, vodsExistentes)
-                }
-                val seriesJob = async {
-                    val seriesArray = catalogoBackend?.seriesArray
-                        ?: buscarArrayXtream(dns, user, pass, "get_series")
-                    sincronizarSeries(db, seriesArray, palavrasProibidas, seriesExistentes)
-                }
+            if (pularDownloadCompleto) {
+                // Banco local já está completo e recente: reaproveita e
+                // vai direto pra parte leve (Top10/Novidades/selos).
+                vodsCompletos = vodsExistentes.values.toList()
+                seriesCompletos = seriesExistentes.values.toList()
+                logTempo("Download completo PULADO (última sync completa há menos de 3h)", "download-pulado")
+            } else {
+                liveJob = scope.async { sincronizarLive(db, dns, user, pass) }
 
-                vodsCompletos = vodJob.await()
-                seriesCompletos = seriesJob.await()
+                // ✅ CORRIGIDO: filmes e séries agora são independentes —
+                // se um download falhar (painel lento/timeout), o outro
+                // continua e o que já estava no banco é mantido, em vez de
+                // abortar a sincronização inteira e deixar a Home vazia.
+                var baixouTudo = true
+                coroutineScope {
+                    val vodJob = async {
+                        try {
+                            val vodArray = catalogoBackend?.vodArray
+                                ?: buscarArrayXtream(dns, user, pass, "get_vod_streams")
+                            sincronizarVod(db, vodArray, palavrasProibidas, vodsExistentes)
+                        } catch (e: CancellationException) {
+                            throw e
+                        } catch (e: Exception) {
+                            e.printStackTrace()
+                            baixouTudo = false
+                            vodsExistentes.values.toList()
+                        }
+                    }
+                    val seriesJob = async {
+                        try {
+                            val seriesArray = catalogoBackend?.seriesArray
+                                ?: buscarArrayXtream(dns, user, pass, "get_series")
+                            sincronizarSeries(db, seriesArray, palavrasProibidas, seriesExistentes)
+                        } catch (e: CancellationException) {
+                            throw e
+                        } catch (e: Exception) {
+                            e.printStackTrace()
+                            baixouTudo = false
+                            seriesExistentes.values.toList()
+                        }
+                    }
+
+                    vodsCompletos = vodJob.await()
+                    seriesCompletos = seriesJob.await()
+                }
+                if (baixouTudo) {
+                    prefsEstado.edit().putLong(chaveUltimaCompleta, System.currentTimeMillis()).apply()
+                }
+                logTempo("VOD + Séries (Xtream ou catálogo do backend, em paralelo)", "baixou-filmes+series")
             }
-            logTempo("VOD + Séries (Xtream ou catálogo do backend, em paralelo)")
+
+            // ✅ CORREÇÃO PRINCIPAL (Home mostrando só 2 filmes/2 séries até
+            // fechar e abrir o app de novo): a Home lê a lista da MEMÓRIA
+            // (ContentRepository), e a memória só era atualizada no FIM de
+            // tudo — depois do upload pro backend (até 40s), do buscarHome
+            // e, se o backend não respondia, do cálculo local do TMDB
+            // (minutos). Enquanto isso o aviso abaixo fazia a Home reler a
+            // memória ainda velha (os ~12 itens do pré-carregamento do
+            // login). Agora a memória é atualizada AQUI, assim que filmes
+            // e séries estão prontos; selos/Top10 chegam depois.
+            if (vodsCompletos.isNotEmpty()) ContentRepository.atualizarVods(vodsCompletos)
+            if (seriesCompletos.isNotEmpty()) ContentRepository.atualizarSeries(seriesCompletos)
             notificarOuvintes()
 
             // ── TMDB (nomes oficiais + top10/novidades) ─────────────────────
@@ -400,21 +475,42 @@ object SyncManager {
                 val ultimaTentativa = prefsBackend.getLong(chaveUltimaTentativa, 0L)
                 val podeTentarEnvio = System.currentTimeMillis() - ultimaTentativa > 6 * 60 * 60 * 1000L
 
+                fun temDados(h: HomeApiClient.HomeCatalogo): Boolean =
+                    h.top10FilmesRank.isNotEmpty() || h.top10SeriesRank.isNotEmpty() ||
+                    h.top10FilmesBrasilRank.isNotEmpty() || h.top10SeriesBrasilRank.isNotEmpty() ||
+                    h.novidadeFilmesData.isNotEmpty() || h.novidadeSeriesData.isNotEmpty()
+
+                var resultadoBackend: HomeApiClient.HomeCatalogo? = null
+
                 if (catalogoBackend == null && !jaEnviouCatalogoAntes && podeTentarEnvio) {
-                    prefsBackend.edit().putLong(chaveUltimaTentativa, System.currentTimeMillis()).apply()
-                    // ✅ CORRIGIDO: só marca "já enviei" se o backend realmente
-                    // recebeu (enviarCatalogo devolve false em timeout/erro).
-                    // Antes marcava sempre — um upload que falhava uma vez
-                    // deixava o backend sem o catálogo desse painel pra sempre.
-                    val enviou = HomeApiClient.enviarCatalogo(dns, vodsCompletos, seriesCompletos)
-                    if (enviou) {
+                    // ✅ NOVO: antes de subir o catálogo inteiro, pergunta se o
+                    // backend JÁ tem esse painel pronto (agora ele guarda por
+                    // servidor, então outro DNS/cliente do mesmo servidor já
+                    // pode ter enviado). Se tiver, não faz upload nenhum.
+                    resultadoBackend = HomeApiClient.buscarHome(dns)
+                    if (resultadoBackend != null && temDados(resultadoBackend)) {
                         prefsBackend.edit().putBoolean(chaveJaEnviou, true).apply()
+                    } else {
+                        prefsBackend.edit().putLong(chaveUltimaTentativa, System.currentTimeMillis()).apply()
+                        // ✅ CORRIGIDO: só marca "já enviei" se o backend realmente
+                        // recebeu (enviarCatalogo devolve false em timeout/erro).
+                        val enviou = HomeApiClient.enviarCatalogo(dns, vodsCompletos, seriesCompletos)
+                        if (enviou) {
+                            prefsBackend.edit().putBoolean(chaveJaEnviou, true).apply()
+                        }
+                        logTempo("enviarCatalogo (só roda na 1ª vez que o backend vê esse painel)", "upload")
+                        resultadoBackend = HomeApiClient.buscarHome(dns)
                     }
+                } else {
+                    resultadoBackend = HomeApiClient.buscarHome(dns)
                 }
-                logTempo("enviarCatalogo (só roda na 1ª vez que este app vê esse painel)")
-                val resultadoBackend = HomeApiClient.buscarHome(dns)
-                logTempo("buscarHome (Top10/Novidades/selos prontos do backend)")
-                if (resultadoBackend != null) {
+                logTempo("buscarHome (Top10/Novidades/selos prontos do backend)", "buscarHome")
+
+                // ✅ CORRIGIDO: só considera "aplicado pelo backend" se ele
+                // devolveu dados de verdade. Antes, uma resposta vazia (painel
+                // sem catálogo no backend) pulava o cálculo local e a Home
+                // ficava sem Top10/selos.
+                if (resultadoBackend != null && temDados(resultadoBackend)) {
                     HomeBackendSync.aplicar(db, resultadoBackend)
                     aplicadoPeloBackend = true
                     logTempo("HomeBackendSync.aplicar (grava Top10/Novidades/selos no Room)")
@@ -429,7 +525,7 @@ object SyncManager {
                 // caso o backend não tenha respondido com nada pronto.
                 try {
                     TmdbSyncHelper.sincronizar(db)
-                    logTempo("TmdbSyncHelper.sincronizar (fallback local, backend não respondeu)")
+                    logTempo("TmdbSyncHelper.sincronizar (fallback local, backend não respondeu)", "TMDB-local")
                 } catch (e: Exception) {
                     e.printStackTrace()
                 }
@@ -454,8 +550,18 @@ object SyncManager {
             val seriesFinal = db.streamDao().getAllSeries()
             ContentRepository.atualizarVods(vodsFinal)
             ContentRepository.atualizarSeries(seriesFinal)
-            logTempo("FIM da sincronização (ContentRepository atualizado)")
+            logTempo("FIM da sincronização (ContentRepository atualizado)", "FIM")
             notificarOuvintes()
+
+            if (primeiraDaSessao) {
+                val texto = "SYNC: " + marcas.joinToString(" | ") +
+                    (if (aplicadoPeloBackend) " | Top10=backend" else " | Top10=local")
+                Handler(Looper.getMainLooper()).post {
+                    try {
+                        Toast.makeText(context.applicationContext, texto, Toast.LENGTH_LONG).show()
+                    } catch (e: Exception) { }
+                }
+            }
 
             // Canais ao vivo: só agora esperamos (já rodava em paralelo desde
             // o início). Falha aqui não afeta filmes/séries.
@@ -489,7 +595,7 @@ object SyncManager {
             .connectTimeout(15, TimeUnit.SECONDS)
             .readTimeout(60, TimeUnit.SECONDS)
             .writeTimeout(30, TimeUnit.SECONDS)
-            .callTimeout(120, TimeUnit.SECONDS)
+            .callTimeout(300, TimeUnit.SECONDS)
             .retryOnConnectionFailure(true)
             .dns(XtreamApi.buildSafeDns())
             .addInterceptor(VpnInterceptor())
