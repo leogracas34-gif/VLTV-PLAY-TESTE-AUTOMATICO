@@ -31,6 +31,8 @@ import com.vltv.play.data.CategoryEntity
 import com.vltv.play.data.VodEntity
 import com.google.android.material.bottomnavigation.BottomNavigationView
 import kotlinx.coroutines.*
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import org.json.JSONObject
 import java.net.URL
 import java.net.URLEncoder
@@ -49,13 +51,23 @@ class VodActivity : AppCompatActivity() {
     private lateinit var prefs: SharedPreferences
     private lateinit var gridCachePrefs: SharedPreferences
 
-    // ✅ NOVO: controle de "última sincronização" por categoria, salvo em
-    // SharedPreferences (sobrevive entre aberturas da Activity/app, ao
-    // contrário do moviesCache que é só em memória). Usado para não bater
-    // no servidor de novo toda vez que a tela de VOD é reaberta — ver
-    // categoriaEstaFresca() / marcarCategoriaSincronizada() mais abaixo.
+    // Controle de "última sincronização" por categoria, salvo em
+    // SharedPreferences (sobrevive entre aberturas da Activity/app).
     private lateinit var syncPrefs: SharedPreferences
     private val SYNC_STALE_MS = 6 * 60 * 60 * 1000L // 6 horas
+
+    // ✅ NOVO: depois que o TMDB responde "esse filme não tem logo", o app
+    // lembra por 7 dias e não pergunta de novo a cada rolagem.
+    private val SEM_LOGO_TTL_MS = 7L * 24 * 60 * 60 * 1000
+
+    // ✅ NOVO: no máximo 3 buscas de logo ao mesmo tempo (antes não havia
+    // limite: rolar a lista disparava dezenas de chamadas juntas, brigando
+    // por banda com os pôsteres e com a API do servidor).
+    private val logoSemaphore = Semaphore(3)
+
+    // ✅ NOVO: Regex criada UMA vez (antes era recriada a cada chamada,
+    // milhares de vezes por ordenação).
+    private val regexAno = Regex("\\b(19|20)\\d{2}\\b")
 
     // Cache em memória da sessão — evita bater na rede duas vezes para a mesma categoria
     private val moviesCache = mutableMapOf<String, List<VodStream>>()
@@ -80,9 +92,9 @@ class VodActivity : AppCompatActivity() {
     // Detecção de TV centralizada em DeviceUtils.kt (context.isTelevisionDevice()),
     // usada em todo o app — não reimplementar localmente aqui.
 
-    // ✅ Filtro central de conteúdo adulto para FILMES — chamado em TODO ponto
-    // onde uma lista vai pro adapter, não importa de onde os dados vieram
-    // (cache em memória, ContentRepository, banco Room, rede ou favoritos).
+    // ✅ Filtro central de conteúdo adulto para FILMES. Agora é chamado
+    // DENTRO do submitList do adapter (em thread de fundo), então quem
+    // chama só entrega a lista crua.
     private fun filtrarFilmesAdultos(lista: List<VodStream>): List<VodStream> {
         return if (ParentalControlManager.isEnabled(this))
             lista.filterNot { ParentalControlManager.isAdultName(it.name) || ParentalControlManager.isAdultName(it.title) }
@@ -96,23 +108,21 @@ class VodActivity : AppCompatActivity() {
         else lista
     }
 
-    // ✅ NOVO: extrai o ano (19xx ou 20xx) embutido no nome do filme, ex:
-    // "Nome do Filme (2026)" → 2026. Usado para ordenar sempre do mais
-    // recente para o mais antigo. Filmes sem ano detectável vão pro final.
-    // ⚠️ Aceita String? porque o servidor Xtream às vezes manda "name"
-    // nulo/ausente pra algum stream — o Gson ignora o tipo não-nulo do
-    // Kotlin nesse caso, e o app crashava (NullPointerException) ao tentar
-    // ordenar a lista com um nome nulo no meio.
+    // Extrai o ano (19xx ou 20xx) do nome do filme. Aceita String? porque o
+    // servidor Xtream às vezes manda "name" nulo.
     private fun extrairAnoFilme(nome: String?): Int {
         if (nome.isNullOrEmpty()) return 0
-        return Regex("\\b(19|20)\\d{2}\\b").find(nome)?.value?.toIntOrNull() ?: 0
+        return regexAno.find(nome)?.value?.toIntOrNull() ?: 0
     }
 
-    // ✅ NOVO: verdadeiro se essa categoria já foi sincronizada com o
-    // servidor há menos de SYNC_STALE_MS. Enquanto estiver "fresca", o app
-    // confia 100% no que já está salvo no Room/ContentRepository e NÃO
-    // busca de novo na rede — é isso que elimina o "re-sync" toda vez que
-    // a tela de VOD é reaberta.
+    // ✅ NOVO: calcula o ano UMA vez por filme e depois ordena (antes o
+    // sortedByDescending chamava a Regex várias vezes por item, na thread
+    // principal). Ordem estável: filmes sem ano ficam no final.
+    private fun ordenarPorAno(lista: List<VodStream>): List<VodStream> =
+        lista.map { extrairAnoFilme(it.name) to it }
+            .sortedByDescending { it.first }
+            .map { it.second }
+
     private fun categoriaEstaFresca(categoriaId: String): Boolean {
         val ultimaSync = syncPrefs.getLong("sync_$categoriaId", 0L)
         return (System.currentTimeMillis() - ultimaSync) < SYNC_STALE_MS
@@ -121,6 +131,11 @@ class VodActivity : AppCompatActivity() {
     private fun marcarCategoriaSincronizada(categoriaId: String) {
         syncPrefs.edit().putLong("sync_$categoriaId", System.currentTimeMillis()).apply()
     }
+
+    private fun paraVodStreams(lista: List<VodEntity>): List<VodStream> =
+        lista.map {
+            VodStream(it.stream_id, it.name, it.title, it.stream_icon, it.container_extension, it.rating, it.added, it.tmdb_release_date)
+        }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -210,31 +225,20 @@ class VodActivity : AppCompatActivity() {
         ultimaCategoriaId   = catPrefs.getString("ultima_cat_id", null)
         ultimaCategoriaNome = catPrefs.getString("ultima_cat_nome", null)
 
-        // ── CARREGAMENTO INSTANTÂNEO DE FILMES ───────────────────────────────
-        // ContentRepository.getVodsByCategory() = O(1), retorna em < 1ms.
+        // ── CARREGAMENTO INSTANTÂNEO DE FILMES (quando o repositório já está pronto) ──
         val catId = ultimaCategoriaId
         if (catId != null) {
             val filmesEmMemoria = ContentRepository.getVodsByCategory(catId)
             if (filmesEmMemoria.isNotEmpty()) {
                 categoriaAtualId = catId
                 if (ultimaCategoriaNome != null) tvCategoryTitle.text = ultimaCategoriaNome
-                filmesEmMemoria.take(30).forEach { vod ->
-                    val cached = gridCachePrefs.getString("logo_${vod.name}", null)
-                    if (cached != null) logoMemoryCache[vod.name] = cached
-                }
-                val items = filmesEmMemoria.map {
-                    VodStream(it.stream_id, it.name, it.title, it.stream_icon, it.container_extension, it.rating)
-                }
-                // ✅ Filtro aplicado também no carregamento instantâneo
-                val itemsFiltrados = filtrarFilmesAdultos(items)
-                moviesAdapter?.submitList(itemsFiltrados)
-                preLoadImages(itemsFiltrados)
+                // Filtro, ordenação, diff e pré-carga de capas acontecem
+                // dentro do submitList (em thread de fundo).
+                moviesAdapter?.submitList(paraVodStreams(filmesEmMemoria))
             }
         }
 
         // ── CARREGAMENTO INSTANTÂNEO DE CATEGORIAS ───────────────────────────
-        // Lê do banco Room (thread IO, ~2ms) → mostra imediatamente.
-        // A rede atualiza em background e só reaplica se algo mudou.
         lifecycleScope.launch(Dispatchers.IO) {
             try {
                 val categoriasSalvas = database.streamDao().getCategoriesByType("vod")
@@ -293,8 +297,7 @@ class VodActivity : AppCompatActivity() {
         BottomNavProfileHelper.aplicarPerfilNoRodape(this, bottomNavigation, currentProfile, currentProfileIcon)
     }
 
-    // ✅ Corrigido: usa lifecycleScope em vez de CoroutineScope(Dispatchers.IO) solta.
-    // Assim a coroutine é cancelada automaticamente quando a Activity é destruída,
+    // Usa lifecycleScope: a coroutine é cancelada junto com a Activity,
     // evitando "You cannot start a load for a destroyed activity".
     private fun preLoadImages(filmes: List<VodStream>) {
         lifecycleScope.launch(Dispatchers.IO) {
@@ -313,33 +316,38 @@ class VodActivity : AppCompatActivity() {
         }
     }
 
-    // ✅ "Vassoura" — a lista de tarjas de qualidade/idioma/formato foi
-    // movida pro TituloCleaner.kt (fonte única, usada em várias telas).
-
-    // ✅ Delega pro TituloCleaner (fonte única, também usado em Details,
-    // SeriesDetails, Novidades e SeriesActivity) em vez de manter sua
-    // própria regex de tarjas aqui.
-    private fun limparNomeParaBuscaLogo(rawName: String, yearRegex: Regex): String {
-        return TituloCleaner.limparParaBusca(rawName)
+    // ✅ NOVO: leitura de URL com timeout (antes URL.readText() não tinha
+    // timeout nenhum e podia ficar pendurada).
+    private fun lerUrl(url: String): String {
+        val c = URL(url).openConnection() as java.net.HttpURLConnection
+        c.connectTimeout = 6000
+        c.readTimeout = 6000
+        return try {
+            c.inputStream.bufferedReader().use { it.readText() }
+        } finally {
+            c.disconnect()
+        }
     }
 
+    // Devolve:
+    //  - a URL do logo, se achou;
+    //  - "" (vazio) se o TMDB respondeu e o filme NÃO tem logo (vira cache negativo);
+    //  - null se deu erro de rede (não guarda nada, tenta de novo depois).
     private suspend fun searchTmdbLogoVod(rawName: String): String? {
         val apiKey = TmdbConfig.API_KEY
-        val yearRegex = Regex("\\b(19|20)\\d{2}\\b")
-        val year = yearRegex.find(rawName)?.value
-        val cleanName = limparNomeParaBuscaLogo(rawName, yearRegex)
+        val year = regexAno.find(rawName)?.value
+        val cleanName = TituloCleaner.limparParaBusca(rawName)
         return try {
             var url = "https://api.themoviedb.org/3/search/movie?api_key=$apiKey" +
                     "&query=${URLEncoder.encode(cleanName, "UTF-8")}&language=pt-BR&region=BR&include_adult=false"
             if (year != null) url += "&year=$year"
-            val results = JSONObject(URL(url).readText()).getJSONArray("results")
-            if (results.length() == 0) return null
+            val results = JSONObject(lerUrl(url)).getJSONArray("results")
+            if (results.length() == 0) return ""
             val id = results.getJSONObject(0).getString("id")
             val logos = JSONObject(
-                URL("https://api.themoviedb.org/3/movie/$id/images?api_key=$apiKey&include_image_language=pt,en,null")
-                    .readText()
+                lerUrl("https://api.themoviedb.org/3/movie/$id/images?api_key=$apiKey&include_image_language=pt,en,null")
             ).getJSONArray("logos")
-            if (logos.length() == 0) return null
+            if (logos.length() == 0) return ""
             var path: String? = null
             for (i in 0 until logos.length()) {
                 if (logos.getJSONObject(i).optString("iso_639_1") == "pt") {
@@ -353,7 +361,6 @@ class VodActivity : AppCompatActivity() {
 
     /**
      * Busca categorias da REDE em background.
-     * Só reaplica na tela se a lista mudou em relação ao que já está exibido.
      * Salva no banco para a próxima abertura ser instantânea.
      */
     private fun carregarCategoriasRede() {
@@ -379,7 +386,6 @@ class VodActivity : AppCompatActivity() {
                             }
                         }
 
-                        // Salva no banco em background (próxima abertura será instantânea)
                         lifecycleScope.launch(Dispatchers.IO) {
                             try {
                                 val entities = lista.map {
@@ -390,14 +396,11 @@ class VodActivity : AppCompatActivity() {
                             } catch (e: Exception) { e.printStackTrace() }
                         }
 
-                        // ✅ Lista crua aqui — o filtro é aplicado dentro de
-                        // aplicarCategorias(), centralizando a regra num único lugar.
                         val cats = mutableListOf<LiveCategory>()
                         cats.add(LiveCategory(category_id = "FAV", category_name = "FAVORITOS"))
                         cats.addAll(lista)
 
                         // Só reaplica se o adapter ainda não tem categorias
-                        // (evita piscar quando o banco já carregou)
                         if (categoryAdapter == null) {
                             aplicarCategorias(cats)
                         }
@@ -410,8 +413,6 @@ class VodActivity : AppCompatActivity() {
     private fun aplicarCategorias(categoriasOriginais: List<LiveCategory>) {
         if (isFinishing || isDestroyed) return
 
-        // ✅ Filtro central de conteúdo adulto. Roda sempre, não importa se a
-        // lista veio do banco Room (carregamento instantâneo) ou da rede.
         val categorias = filtrarCategoriasAdultas(categoriasOriginais)
 
         val catSalvaId = ultimaCategoriaId
@@ -452,23 +453,21 @@ class VodActivity : AppCompatActivity() {
             .apply()
     }
 
-    // ✅ CORRIGIDO (bug do "re-sync" toda vez que reabre a tela de VOD):
-    // antes, esta função só evitava rebuscar na rede se moviesCache (memória
-    // da Activity) já tivesse a categoria — e como uma Activity NOVA é
-    // criada toda vez que você sai da tela de VOD e volta, esse cache
-    // sempre estava vazio, então o app batia no servidor de novo em TODA
-    // abertura, mesmo com os dados já salvos e corretos no Room/
-    // ContentRepository. Isso causava o "pisca e reordena" que você via.
-    //
-    // Agora, além do cache de memória, checamos categoriaEstaFresca():
-    // se essa categoria já foi sincronizada com o servidor há menos de
-    // SYNC_STALE_MS (6h), a função nem chega a fazer a chamada de rede —
-    // confia 100% no que já está salvo localmente. A tela volta a
-    // sincronizar de verdade só depois desse intervalo, ou se você atualizar
-    // manualmente em outro ponto do app.
+    // Atualização em segundo plano. Só roda se a categoria não estiver
+    // "fresca" (6h) e SÓ DEPOIS que o ContentRepository estiver pronto
+    // (sem ele não dá pra saber o que já existe, e a gravação poderia
+    // apagar logos/selos já calculados).
     private fun atualizarEmBackground(categoria: LiveCategory) {
         if (moviesCache.containsKey(categoria.id)) return
         if (categoriaEstaFresca(categoria.id)) return
+        if (!ContentRepository.pronto) {
+            ContentRepository.aoFicarPronto {
+                if (!isFinishing && !isDestroyed && categoriaAtualId == categoria.id) {
+                    atualizarEmBackground(categoria)
+                }
+            }
+            return
+        }
         XtreamApi.service.getVodStreams(username, password, categoryId = categoria.id)
             .enqueue(object : retrofit2.Callback<List<VodStream>> {
                 override fun onResponse(
@@ -477,10 +476,11 @@ class VodActivity : AppCompatActivity() {
                 ) {
                     if (!response.isSuccessful || response.body() == null) return
                     val filmes = response.body()!!
-                    // ✅ Cache guarda a lista crua — filtro aplicado só no submit
                     moviesCache[categoria.id] = filmes
                     if (categoriaAtualId == categoria.id) {
-                        moviesAdapter?.submitList(filtrarFilmesAdultos(filmes))
+                        // rolarTopo = false: a atualização de fundo não pode
+                        // jogar o usuário de volta pro topo enquanto ele navega.
+                        moviesAdapter?.submitList(filmes, rolarTopo = false)
                     }
                     salvarNoBancoERepositorio(categoria.id, filmes)
                     marcarCategoriaSincronizada(categoria.id)
@@ -489,60 +489,61 @@ class VodActivity : AppCompatActivity() {
             })
     }
 
+    // ✅ NOVO: lê SÓ a categoria pedida direto do Room (consulta local,
+    // milissegundos). Usada quando o ContentRepository ainda não terminou
+    // de carregar o catálogo inteiro — antes a tela ficava vazia
+    // esperando ele.
+    private suspend fun lerVodsDoRoom(categoryId: String): List<VodStream> =
+        paraVodStreams(database.streamDao().getVodsByCategory(categoryId))
+
     private fun carregarFilmes(categoria: LiveCategory) {
         tvCategoryTitle.text = categoria.name
         categoriaAtualId = categoria.id
         salvarUltimaCategoria(categoria)
 
-        // 1. Cache de memória da API — instantâneo
-        // ✅ Sem filtro de "últimos 3 meses": a tela de Filmes mostra o
-        // catálogo completo em todas as abas. Esse filtro agora só existe
-        // na Home (Novidades/Top 10), não aqui.
+        // 1. Cache de memória da sessão — instantâneo
         moviesCache[categoria.id]?.let {
-            val filtrados = filtrarFilmesAdultos(it)
-            moviesAdapter?.submitList(filtrados); preLoadImages(filtrados); return
+            moviesAdapter?.submitList(it); return
         }
 
         // 2. ContentRepository — O(1), instantâneo (quando já está pronto)
-        //
-        // ✅ CORREÇÃO (tela aparecia vazia por alguns segundos TODA vez que
-        // abria, mesmo reabrindo na hora): o ContentRepository é carregado
-        // em background pelo VLTVApplication assim que o processo do app
-        // inicia. Se o usuário chegasse nesta tela rápido demais — antes
-        // dessa carga terminar —, getVodsByCategory() retornava lista vazia
-        // mesmo a categoria tendo filmes salvos localmente, e o código caía
-        // direto no item 3 (rede), que é bem mais lento e gerava a demora
-        // visível. Agora, se o repositório ainda não estiver pronto, a tela
-        // espera ele terminar (leitura local do Room, geralmente bem menos
-        // de 1 segundo, sem nenhuma chamada de rede) antes de decidir se
-        // precisa mesmo buscar da rede.
-        if (!ContentRepository.pronto) {
-            ContentRepository.aoFicarPronto {
-                if (isFinishing || isDestroyed) return@aoFicarPronto
-                if (categoriaAtualId == categoria.id) carregarFilmes(categoria)
+        if (ContentRepository.pronto) {
+            val emRepositorio = ContentRepository.getVodsByCategory(categoria.id)
+            if (emRepositorio.isNotEmpty()) {
+                moviesAdapter?.submitList(paraVodStreams(emRepositorio))
+                atualizarEmBackground(categoria)
+                return
             }
-            return
-        }
-        val emRepositorio = ContentRepository.getVodsByCategory(categoria.id)
-        if (emRepositorio.isNotEmpty()) {
-            emRepositorio.take(30).forEach { vod ->
-                val cached = gridCachePrefs.getString("logo_${vod.name}", null)
-                if (cached != null) logoMemoryCache[vod.name] = cached
-            }
-            val items = emRepositorio.map {
-                VodStream(it.stream_id, it.name, it.title, it.stream_icon, it.container_extension, it.rating, it.added, it.tmdb_release_date)
-            }
-            val itemsFiltrados = filtrarFilmesAdultos(items)
-            moviesAdapter?.submitList(itemsFiltrados)
-            preLoadImages(itemsFiltrados)
-            // ✅ Só tenta atualizar em segundo plano se a categoria não
-            // estiver "fresca" (ver categoriaEstaFresca) — evita o re-sync
-            // repetido toda vez que essa categoria é reaberta.
-            atualizarEmBackground(categoria)
+            carregarFilmesDaRede(categoria)
             return
         }
 
-        // 3. Sem dados locais — primeira instalação
+        // 3. ✅ CORRIGIDO: repositório ainda carregando → lê só esta
+        // categoria direto do Room (rápido) em vez de esperar o catálogo
+        // inteiro. Se a leitura falhar por qualquer motivo, cai no
+        // comportamento antigo (espera o repositório).
+        lifecycleScope.launch(Dispatchers.IO) {
+            val locais = try { lerVodsDoRoom(categoria.id) } catch (e: Exception) { null }
+            withContext(Dispatchers.Main) {
+                if (isFinishing || isDestroyed || categoriaAtualId != categoria.id) return@withContext
+                when {
+                    locais == null -> ContentRepository.aoFicarPronto {
+                        if (!isFinishing && !isDestroyed && categoriaAtualId == categoria.id) {
+                            carregarFilmes(categoria)
+                        }
+                    }
+                    locais.isNotEmpty() -> {
+                        moviesAdapter?.submitList(locais)
+                        atualizarEmBackground(categoria)
+                    }
+                    else -> carregarFilmesDaRede(categoria)
+                }
+            }
+        }
+    }
+
+    // Sem dados locais — primeira instalação
+    private fun carregarFilmesDaRede(categoria: LiveCategory) {
         progressBar.visibility = View.VISIBLE
         XtreamApi.service.getVodStreams(username, password, categoryId = categoria.id)
             .enqueue(object : retrofit2.Callback<List<VodStream>> {
@@ -555,9 +556,7 @@ class VodActivity : AppCompatActivity() {
                     val filmes = response.body()!!
                     moviesCache[categoria.id] = filmes
                     if (categoriaAtualId == categoria.id) {
-                        val filtrados = filtrarFilmesAdultos(filmes)
-                        moviesAdapter?.submitList(filtrados)
-                        preLoadImages(filtrados)
+                        moviesAdapter?.submitList(filmes)
                     }
                     salvarNoBancoERepositorio(categoria.id, filmes)
                     marcarCategoriaSincronizada(categoria.id)
@@ -568,18 +567,72 @@ class VodActivity : AppCompatActivity() {
             })
     }
 
+    // ✅ CORRIGIDO: antes recriava TODOS os filmes só com os campos básicos
+    // e gravava tudo de novo, o que podia apagar logo/selos/TMDB já
+    // calculados (tanto no banco quanto na memória, afetando a Home).
+    // Agora:
+    //  - filme que já existe e não mudou (nome, capa, extensão) mantém o
+    //    objeto original COMPLETO (com tudo que o TMDB já calculou);
+    //  - só filmes novos ou alterados vão pro banco.
     private fun salvarNoBancoERepositorio(categoryId: String, filmes: List<VodStream>) {
         lifecycleScope.launch(Dispatchers.IO) {
             try {
-                val entities = filmes.map {
-                    VodEntity(it.stream_id, it.name, it.title, it.stream_icon,
-                        it.container_extension, it.rating, categoryId,
-                        if (it.added > 0) it.added else System.currentTimeMillis() / 1000)
+                val existentes = ContentRepository.getVodsByCategory(categoryId).associateBy { it.stream_id }
+                // Só monta o mapa geral se aparecer filme fora desta categoria
+                // (ex.: mudou de categoria no provedor).
+                val globais by lazy { ContentRepository.vods.associateBy { it.stream_id } }
+                val agoraSeg = System.currentTimeMillis() / 1000
+                val mesclada = ArrayList<VodEntity>(filmes.size)
+                val paraGravar = ArrayList<VodEntity>()
+
+                for (f in filmes) {
+                    val antigo = existentes[f.stream_id] ?: globais[f.stream_id]
+                    if (antigo != null &&
+                        antigo.category_id == categoryId &&
+                        antigo.name == f.name &&
+                        antigo.stream_icon == f.stream_icon &&
+                        antigo.container_extension == f.container_extension
+                    ) {
+                        mesclada.add(antigo)
+                    } else {
+                        // Como o insert do DAO é REPLACE, a linha gravada
+                        // precisa estar COMPLETA: se o filme já existia, usa
+                        // copy() do original (mantém logo, TMDB, Top10, etc.)
+                        // trocando só o que veio novo do provedor.
+                        val nova = if (antigo != null) {
+                            antigo.copy(
+                                name = f.name, title = f.title, stream_icon = f.stream_icon,
+                                container_extension = f.container_extension, rating = f.rating,
+                                category_id = categoryId
+                            )
+                        } else {
+                            VodEntity(
+                                f.stream_id, f.name, f.title, f.stream_icon,
+                                f.container_extension, f.rating, categoryId,
+                                if (f.added > 0) f.added else agoraSeg
+                            )
+                        }
+                        mesclada.add(nova)
+                        paraGravar.add(nova)
+                    }
                 }
-                database.streamDao().insertVodStreams(entities)
-                ContentRepository.atualizarCategoriaVod(categoryId, entities)
+
+                if (paraGravar.isEmpty() && mesclada.size == existentes.size) return@launch
+
+                // NonCancellable: se o usuário sair da tela no meio, a
+                // gravação termina inteira em vez de ficar pela metade.
+                withContext(NonCancellable) {
+                    if (paraGravar.isNotEmpty()) database.streamDao().insertVodStreams(paraGravar)
+                    ContentRepository.atualizarCategoriaVod(categoryId, mesclada)
+                }
             } catch (e: Exception) { e.printStackTrace() }
         }
+    }
+
+    private fun getFavMovies(context: Context): MutableSet<Int> {
+        val p = context.getSharedPreferences("vltv_favoritos", Context.MODE_PRIVATE)
+        return p.getStringSet("${currentProfile}_favoritos", emptySet())
+            ?.mapNotNull { it.toIntOrNull() }?.toMutableSet() ?: mutableSetOf()
     }
 
     private fun carregarFilmesFavoritos() {
@@ -589,7 +642,7 @@ class VodActivity : AppCompatActivity() {
         if (favIds.isEmpty()) { moviesAdapter?.submitList(emptyList()); return }
         val listaNoCache = moviesCache.values.flatten().distinctBy { it.id }.filter { favIds.contains(it.id) }
         if (listaNoCache.size >= favIds.size) {
-            moviesAdapter?.submitList(filtrarFilmesAdultos(listaNoCache)); return
+            moviesAdapter?.submitList(listaNoCache); return
         }
         progressBar.visibility = View.VISIBLE
         XtreamApi.service.getVodStreams(username, password, categoryId = "0")
@@ -604,14 +657,12 @@ class VodActivity : AppCompatActivity() {
                     moviesCache["ALL_FOR_FAV"] = todos
                     val favs = todos.filter { favIds.contains(it.id) }
                     if (categoriaAtualId == "FAV") {
-                        val favsFiltrados = filtrarFilmesAdultos(favs)
-                        moviesAdapter?.submitList(favsFiltrados)
-                        preLoadImages(favsFiltrados)
+                        moviesAdapter?.submitList(favs)
                     }
                 }
                 override fun onFailure(call: retrofit2.Call<List<VodStream>>, t: Throwable) {
                     progressBar.visibility = View.GONE
-                    if (categoriaAtualId == "FAV") moviesAdapter?.submitList(filtrarFilmesAdultos(listaNoCache))
+                    if (categoriaAtualId == "FAV") moviesAdapter?.submitList(listaNoCache)
                 }
             })
     }
@@ -627,12 +678,6 @@ class VodActivity : AppCompatActivity() {
         })
     }
 
-    private fun getFavMovies(context: Context): MutableSet<Int> {
-        val p = context.getSharedPreferences("vltv_favoritos", Context.MODE_PRIVATE)
-        return p.getStringSet("${currentProfile}_favoritos", emptySet())
-            ?.mapNotNull { it.toIntOrNull() }?.toMutableSet() ?: mutableSetOf()
-    }
-
     private fun mostrarMenuDownload(filme: VodStream) {
         val popup = PopupMenu(this, findViewById(android.R.id.content))
         menuInflater.inflate(R.menu.menu_download, popup.menu)
@@ -645,10 +690,7 @@ class VodActivity : AppCompatActivity() {
     }
 
     // =========================================================================
-    // ADAPTER DE CATEGORIAS — chips estilo pill, com degradê vermelho quando
-    // selecionado e contorno sutil quando não selecionado. Foco de TV usa um
-    // contorno neon próprio (bg_chip_focused) e sempre restaura o estilo base
-    // correto (selecionado ou não) ao perder o foco.
+    // ADAPTER DE CATEGORIAS — chips estilo pill
     // =========================================================================
     inner class VodCategoryAdapter(
         private val list: List<LiveCategory>,
@@ -710,32 +752,45 @@ class VodActivity : AppCompatActivity() {
     }
 
     // =========================================================================
-    // ADAPTER DE FILMES — DiffUtil, sem placeholder, sem círculo
+    // ADAPTER DE FILMES — filtro + ordenação + DiffUtil em thread de fundo
     // =========================================================================
     inner class VodAdapter(
         private val onItemClick: (VodStream) -> Unit,
         private val onDownloadClick: (VodStream) -> Unit
     ) : RecyclerView.Adapter<VodAdapter.VH>() {
 
-        private val items = mutableListOf<VodStream>()
+        // Lista imutável, só trocada na thread principal.
+        private var items: List<VodStream> = emptyList()
 
-        // ✅ NOVO: toda lista enviada pro adapter é ordenada do filme mais
-        // recente (ano maior) pro mais antigo, e o RecyclerView é reposicionado
-        // no topo — corrige tanto a ordem por ano quanto o bug de abrir a tela
-        // no meio/final da lista.
-        fun submitList(newList: List<VodStream>) {
-            val listaOrdenada = newList.sortedByDescending { extrairAnoFilme(it.name) }
-            val diff = DiffUtil.calculateDiff(object : DiffUtil.Callback() {
-                override fun getOldListSize() = items.size
-                override fun getNewListSize() = listaOrdenada.size
-                override fun areItemsTheSame(o: Int, n: Int) = items[o].id == listaOrdenada[n].id
-                override fun areContentsTheSame(o: Int, n: Int) =
-                    items[o].name == listaOrdenada[n].name && items[o].icon == listaOrdenada[n].icon
-            })
-            items.clear()
-            items.addAll(listaOrdenada)
-            diff.dispatchUpdatesTo(this)
-            rvMovies.scrollToPosition(0)
+        // Cada submitList ganha um número; só o mais recente é aplicado
+        // (resposta atrasada de categoria anterior é descartada).
+        private var versaoSubmit = 0
+
+        // ✅ CORRIGIDO: o trabalho pesado (filtro adulto, ordenar por ano,
+        // calcular o diff) agora roda em Dispatchers.Default. Na thread
+        // principal só entra a aplicação do resultado. Antes tudo isso
+        // acontecia na main thread e travava a tela.
+        // rolarTopo = false é usado nas atualizações de fundo.
+        fun submitList(novaLista: List<VodStream>, rolarTopo: Boolean = true) {
+            val versao = ++versaoSubmit
+            val antigos = items
+            lifecycleScope.launch(Dispatchers.Default) {
+                val ordenada = ordenarPorAno(filtrarFilmesAdultos(novaLista))
+                val diff = DiffUtil.calculateDiff(object : DiffUtil.Callback() {
+                    override fun getOldListSize() = antigos.size
+                    override fun getNewListSize() = ordenada.size
+                    override fun areItemsTheSame(o: Int, n: Int) = antigos[o].id == ordenada[n].id
+                    override fun areContentsTheSame(o: Int, n: Int) =
+                        antigos[o].name == ordenada[n].name && antigos[o].icon == ordenada[n].icon
+                }, false)
+                withContext(Dispatchers.Main) {
+                    if (isFinishing || isDestroyed || versao != versaoSubmit) return@withContext
+                    items = ordenada
+                    diff.dispatchUpdatesTo(this@VodAdapter)
+                    if (rolarTopo) rvMovies.scrollToPosition(0)
+                    preLoadImages(ordenada)
+                }
+            }
         }
 
         inner class VH(v: View) : RecyclerView.ViewHolder(v) {
@@ -747,6 +802,13 @@ class VodActivity : AppCompatActivity() {
 
         override fun onCreateViewHolder(p: ViewGroup, t: Int) =
             VH(LayoutInflater.from(p.context).inflate(R.layout.item_vod, p, false))
+
+        // Item saiu da tela → cancela a busca de logo que ainda não terminou.
+        override fun onViewRecycled(holder: VH) {
+            holder.job?.cancel()
+            holder.job = null
+            super.onViewRecycled(holder)
+        }
 
         override fun onBindViewHolder(h: VH, p: Int) {
             h.job?.cancel()
@@ -781,26 +843,40 @@ class VodActivity : AppCompatActivity() {
                     Glide.with(h.itemView.context).load(diskCached)
                         .diskCacheStrategy(DiskCacheStrategy.ALL).dontAnimate().into(h.imgLogo)
                 } else {
-                    // ✅ Corrigido: lifecycleScope em vez de CoroutineScope(Dispatchers.IO)
-                    // solta. Isso cancela automaticamente a busca de logo se a Activity
-                    // for destruída, evitando o crash "destroyed activity" no Glide.with().
-                    h.job = lifecycleScope.launch(Dispatchers.IO) {
-                        val url = searchTmdbLogoVod(item.name)
-                        if (url != null) {
-                            logoMemoryCache[item.name] = url
-                            gridCachePrefs.edit().putString("logo_${item.name}", url).apply()
-                            withContext(Dispatchers.Main) {
-                                // ✅ Guard extra: nunca chama Glide se a Activity já
-                                // estiver finalizando/destruída (ex: usuário saiu da tela
-                                // enquanto a busca TMDB ainda estava em andamento).
-                                if (isFinishing || isDestroyed) return@withContext
-                                if (h.adapterPosition == p) {
-                                    h.tvName.visibility  = View.GONE
-                                    h.imgLogo.visibility = View.VISIBLE
-                                    Glide.with(h.itemView.context).load(url)
-                                        .override(200, 110)
-                                        .diskCacheStrategy(DiskCacheStrategy.ALL)
-                                        .dontAnimate().into(h.imgLogo)
+                    // ✅ Só busca se o TMDB não disse "sem logo" nos últimos 7 dias.
+                    val semLogoEm = gridCachePrefs.getLong("semlogo_${item.name}", 0L)
+                    val deveBuscar = semLogoEm == 0L ||
+                        System.currentTimeMillis() - semLogoEm > SEM_LOGO_TTL_MS
+
+                    if (deveBuscar) {
+                        h.job = lifecycleScope.launch(Dispatchers.IO) {
+                            // Espera um instante: se o item sair da tela
+                            // (rolagem rápida), o job é cancelado aqui e
+                            // nenhuma chamada de rede é feita.
+                            delay(250)
+                            // No máximo 3 buscas simultâneas.
+                            val url = logoSemaphore.withPermit { searchTmdbLogoVod(item.name) }
+                            when {
+                                url == null -> { /* erro de rede: tenta de novo outra hora */ }
+                                url.isEmpty() -> gridCachePrefs.edit()
+                                    .putLong("semlogo_${item.name}", System.currentTimeMillis())
+                                    .apply()
+                                else -> {
+                                    logoMemoryCache[item.name] = url
+                                    gridCachePrefs.edit().putString("logo_${item.name}", url).apply()
+                                    withContext(Dispatchers.Main) {
+                                        if (isFinishing || isDestroyed) return@withContext
+                                        // Confere se esse mesmo item ainda está nessa posição.
+                                        val pos = h.adapterPosition
+                                        if (pos != RecyclerView.NO_POSITION && items.getOrNull(pos)?.name == item.name) {
+                                            h.tvName.visibility  = View.GONE
+                                            h.imgLogo.visibility = View.VISIBLE
+                                            Glide.with(h.itemView.context).load(url)
+                                                .override(200, 110)
+                                                .diskCacheStrategy(DiskCacheStrategy.ALL)
+                                                .dontAnimate().into(h.imgLogo)
+                                        }
+                                    }
                                 }
                             }
                         }
