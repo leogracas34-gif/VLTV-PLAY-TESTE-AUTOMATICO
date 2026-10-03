@@ -990,7 +990,10 @@ class PlayerActivity : AppCompatActivity() {
         val mediaSourceFactory = DefaultMediaSourceFactory(dataSourceFactory)
 
         val isLive         = streamType == "live"
-        val minBufferMs    = 2000
+        // minBufferMs precisa ser >= playRebufferMs, senão o ExoPlayer
+        // lança IllegalArgumentException. Na live o rebuffer é 2500, então
+        // o mínimo sobe pra 3000.
+        val minBufferMs    = if (isLive) 3000 else 2000
         // ✅ OTIMIZADO: live com até 15s de buffer (era 5s) — o início
         // continua rápido (playBufferMs = 1s), mas a reprodução aguenta
         // melhor oscilações de rede sem travar.
