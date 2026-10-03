@@ -329,7 +329,16 @@ class DnsFailoverInterceptor : Interceptor {
         try {
             val response = chain.proceed(original)
             if (response.isSuccessful || !codigoPedeFailover(response.code)) return response
-            falhaHttp = response // mantém aberto; fechado se um reserva funcionar
+            // ✅ CORREÇÃO (IllegalStateException "previous response is still
+            // open"): o OkHttp NÃO deixa fazer outra chamada na mesma chain
+            // enquanto a resposta anterior estiver aberta. Antes ela ficava
+            // aberta aqui pra devolver no fim, e o primeiro reserva já
+            // quebrava. Agora o corpo (página de erro, pequena) é copiado
+            // pra memória, a resposta original é FECHADA, e devolvemos uma
+            // cópia equivalente se nenhum reserva funcionar.
+            val corpoEmMemoria = response.peekBody(1024L * 1024L)
+            falhaHttp = response.newBuilder().body(corpoEmMemoria).build()
+            response.close()
         } catch (e: IOException) {
             falhaIo = e
             // IP do sistema pode estar falso/bloqueado: próxima resolução
@@ -749,7 +758,10 @@ object XtreamApi {
 
     private val okHttpClient: OkHttpClient by lazy {
         OkHttpClient.Builder()
-            .connectTimeout(15, TimeUnit.SECONDS)
+            // ✅ OTIMIZADO: 8s (era 15s). Quando o DNS ativo está fora do
+            // ar, o failover entra bem mais rápido. Se algum dia der
+            // timeout em 4G muito fraco, suba de volta pra 10–12s.
+            .connectTimeout(8, TimeUnit.SECONDS)
             .readTimeout(60, TimeUnit.SECONDS)
             .writeTimeout(30, TimeUnit.SECONDS)
             .retryOnConnectionFailure(true)
