@@ -118,7 +118,15 @@ class PlayerActivity : AppCompatActivity() {
     private val extensoesTentativa = mutableListOf<String>()
     private var extIndex = 0
 
-    private val USER_AGENT = "IPTVSmartersPro"
+    // ⚠️ VERSÃO DE TESTE: antes era "IPTVSmartersPro". Agora usa o MESMO
+    // User-Agent de navegador que o resto do app já usa nas chamadas da API
+    // (VpnInterceptor) — alguns servidores/CDNs recusam o vídeo só pro UA
+    // "IPTVSmartersPro" mesmo aceitando o login.
+    private val USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+
+    // ⚠️ DIAGNÓSTICO TEMPORÁRIO (ver mostrarDiagErro): REMOVER antes de publicar.
+    private var diagErros = 0
+    private var urlAtualDiag = ""
 
     private val database by lazy { AppDatabase.getDatabase(this) }
 
@@ -1098,6 +1106,7 @@ class PlayerActivity : AppCompatActivity() {
             id         = streamId,
             ext        = currentExt
         )
+        urlAtualDiag = url
 
         liberarPlayerGlobalDeOutraInstancia()
         player?.release()
@@ -1179,10 +1188,26 @@ class PlayerActivity : AppCompatActivity() {
             }
 
             override fun onPlayerError(error: PlaybackException) {
+                mostrarDiagErro(error)
                 loading.visibility = View.VISIBLE
                 handler.postDelayed({ tentarProximo() }, 1000L)
             }
         })
+    }
+
+    // ⚠️ DIAGNÓSTICO TEMPORÁRIO (versão de teste): mostra o motivo real da
+    // falha do vídeo (ex.: "Response code: 404", "UnknownHostException",
+    // "SocketTimeoutException"). Só as 3 primeiras falhas de cada abertura
+    // da tela. REMOVER antes de publicar pros clientes.
+    private fun mostrarDiagErro(error: PlaybackException) {
+        if (diagErros >= 3) return
+        diagErros++
+        val causa = error.cause
+        val host = try { Uri.parse(urlAtualDiag).host } catch (e: Exception) { null } ?: "?"
+        val ext = extensoesTentativa.getOrElse(extIndex) { "?" }
+        val detalhe = "${error.errorCodeName} | ${causa?.javaClass?.simpleName ?: "-"}: ${causa?.message ?: ""}"
+        Log.e("VLTV_DIAG", "player .$ext @ $host -> $detalhe")
+        Toast.makeText(this, "DIAG .$ext @ $host\n$detalhe", Toast.LENGTH_LONG).show()
     }
 
     private fun tentarProximo() {
