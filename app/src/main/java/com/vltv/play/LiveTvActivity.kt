@@ -184,7 +184,9 @@ class LiveTvActivity : AppCompatActivity() {
     private val extensoesTentativa = listOf("ts", "m3u8", "")
     private var extIndex = 0
 
-    private val USER_AGENT = "IPTVSmartersPro"
+    // ✅ CENTRALIZADO: o User-Agent agora vem de NetworkConfig, o mesmo
+    // valor usado em todas as telas.
+    private val USER_AGENT = NetworkConfig.USER_AGENT
 
     // ✅ Categoria virtual "Favoritos" — não existe na API do provedor,
     // é injetada localmente no topo da lista de categorias. Selecioná-la
@@ -501,16 +503,23 @@ class LiveTvActivity : AppCompatActivity() {
             .setContentType(C.AUDIO_CONTENT_TYPE_MOVIE)
             .build()
 
+        // ✅ OTIMIZADO: máximo de 15s de buffer (era 5s) e 2,5s pra
+        // retomar depois de um travamento (era 2s). O canal continua
+        // abrindo rápido (começa a tocar com 1s de buffer), mas aguenta
+        // melhor oscilações de rede sem congelar.
         val loadControl = DefaultLoadControl.Builder()
-            .setBufferDurationsMs(2000, 5000, 1000, 2000)
+            .setBufferDurationsMs(2000, 15000, 1000, 2500)
             .setPrioritizeTimeOverSizeThresholds(true)
             .build()
 
+        // ✅ OTIMIZADO: timeouts menores (centralizados em NetworkConfig)
+        // — quando um servidor/extensão não responde, o app passa pro
+        // próximo bem mais rápido em vez de esperar 12s.
         val dataSourceFactory = DefaultHttpDataSource.Factory()
             .setUserAgent(USER_AGENT)
             .setAllowCrossProtocolRedirects(true)
-            .setConnectTimeoutMs(12000)
-            .setReadTimeoutMs(15000)
+            .setConnectTimeoutMs(NetworkConfig.CONNECT_TIMEOUT_MS)
+            .setReadTimeoutMs(NetworkConfig.READ_TIMEOUT_MS)
 
         player = ExoPlayer.Builder(this)
             .setMediaSourceFactory(DefaultMediaSourceFactory(dataSourceFactory))
