@@ -508,7 +508,7 @@ class LiveTvActivity : AppCompatActivity() {
         // abrindo rápido (começa a tocar com 1s de buffer), mas aguenta
         // melhor oscilações de rede sem congelar.
         val loadControl = DefaultLoadControl.Builder()
-            .setBufferDurationsMs(2000, 15000, 1000, 2500)
+            .setBufferDurationsMs(3000, 15000, 1000, 2500)
             .setPrioritizeTimeOverSizeThresholds(true)
             .build()
 
