@@ -32,8 +32,6 @@ import com.vltv.play.data.ProfileEntity
 import com.vltv.play.ui.AvatarSelectionDialog
 import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.Channel
-import kotlinx.coroutines.sync.Semaphore
-import kotlinx.coroutines.sync.withPermit
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import retrofit2.Call
@@ -127,20 +125,16 @@ class SettingsActivity : AppCompatActivity() {
     private val SERVERS: List<String>
         get() = XtreamApi.SERVERS
 
-    // ✅ CORREÇÃO: agora usa o mesmo resolvedor de DNS da LoginActivity
-    // (DNS do sistema primeiro, DoH só se o sistema falhar).
     private val clientRapido = OkHttpClient.Builder()
         .connectTimeout(10, TimeUnit.SECONDS)
         .readTimeout(15, TimeUnit.SECONDS)
         .retryOnConnectionFailure(false)
-        .dns(XtreamApi.buildSafeDns())
         .build()
 
     private val clientLento = OkHttpClient.Builder()
         .connectTimeout(25, TimeUnit.SECONDS)
         .readTimeout(25, TimeUnit.SECONDS)
         .retryOnConnectionFailure(true)
-        .dns(XtreamApi.buildSafeDns())
         .build()
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -1225,16 +1219,16 @@ class SettingsActivity : AppCompatActivity() {
 
             var dnsVencedor: String? = null
             try {
-                // ✅ CORREÇÃO: mesmo esquema da LoginActivity — 1ª rodada
-                // com 1 DNS por painel (lâmina), 2ª rodada com os irmãos.
-                dnsVencedor = testarGrupoEmParalelo(
-                    DnsConfig.primeiraRodada(), novoUsuario, novaSenha, 9, 15_000L
-                )
-                if (dnsVencedor == null) {
-                    dnsVencedor = testarGrupoEmParalelo(
-                        DnsConfig.segundaRodada(), novoUsuario, novaSenha, 6, 15_000L
-                    )
+                val canal = Channel<String>(Channel.UNLIMITED)
+                val jobs = SERVERS.map { url ->
+                    launch(Dispatchers.IO) {
+                        val r = testarServidor(url, novoUsuario, novaSenha, clientRapido)
+                        if (r != null) canal.trySend(r)
+                    }
                 }
+                dnsVencedor = withTimeoutOrNull(18_000L) { canal.receive() }
+                jobs.forEach { it.cancel() }
+                canal.close()
             } catch (e: Exception) {
                 Log.e("VLTV_SETTINGS", "Fase paralela erro: ${e.message}")
             }
@@ -1244,9 +1238,7 @@ class SettingsActivity : AppCompatActivity() {
                     tvStatus.text    = "Tentando servidores alternativos..."
                     tvSubStatus.text = "Aguarde um momento"
                 }
-                val fimFallback = System.currentTimeMillis() + 30_000L
                 for (servidor in SERVERS) {
-                    if (System.currentTimeMillis() > fimFallback) break
                     val r = testarServidor(servidor, novoUsuario, novaSenha, clientLento)
                     if (r != null) { dnsVencedor = r; break }
                 }
@@ -1276,75 +1268,26 @@ class SettingsActivity : AppCompatActivity() {
     // Denied" e caía direto em "Servidor não encontrado", mesmo com
     // usuário/senha corretos. Trocado pro mesmo UA completo de Chrome
     // usado em todo o resto do app, mais Accept-Language.
-    // ✅ NOVO: testa uma lista de DNS em paralelo (no máximo
-    // maxSimultaneos ao mesmo tempo). Devolve o primeiro que responder
-    // com login válido, ou null. Sai assim que todos terminam.
-    private suspend fun CoroutineScope.testarGrupoEmParalelo(
-        lista: List<String>, user: String, pass: String,
-        maxSimultaneos: Int, tetoMs: Long
-    ): String? {
-        if (lista.isEmpty()) return null
-        val canal = Channel<String>(Channel.UNLIMITED)
-        val limite = Semaphore(maxSimultaneos)
-        val jobs = lista.map { url ->
-            launch(Dispatchers.IO) {
-                limite.withPermit {
-                    val r = testarServidor(url, user, pass, clientRapido)
-                    if (r != null) canal.trySend(r)
-                }
-            }
-        }
-        var vencedor: String? = null
-        val inicio = System.currentTimeMillis()
-        while (System.currentTimeMillis() - inicio < tetoMs) {
-            val recebido = withTimeoutOrNull(300L) { canal.receive() }
-            if (recebido != null) { vencedor = recebido; break }
-            if (jobs.all { it.isCompleted }) {
-                vencedor = canal.tryReceive().getOrNull()
-                break
-            }
-        }
-        jobs.forEach { it.cancel() }
-        canal.close()
-        return vencedor
-    }
-
     private fun testarServidor(baseUrl: String, user: String, pass: String, httpClient: OkHttpClient): String? {
         val urlBase     = normalizarBaseUrl(baseUrl)
         val urlSemBarra = urlBase.removeSuffix("/")
-        val host = try { java.net.URI(urlSemBarra).host ?: urlSemBarra } catch (e: Exception) { urlSemBarra }
-
-        // ✅ NOVO: mesmo esquema da LoginActivity — tenta o User-Agent
-        // preferido do painel e, se vier 403/406, tenta o outro.
-        for (ua in UaHelper.ordemParaHost(host)) {
-            var codigo = -1
-            val resultado: String? = try {
-                val request = Request.Builder()
-                    .url("$urlSemBarra/player_api.php?username=$user&password=$pass")
-                    .header("User-Agent", ua)
-                    .header("Accept-Language", "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7")
-                    .build()
-                httpClient.newCall(request).execute().use { response ->
-                    codigo = response.code
-                    if (response.isSuccessful) {
-                        val body = response.body?.string() ?: ""
-                        val valido = body.contains("user_info") &&
-                                body.contains("server_info") &&
-                                !body.contains("\"auth\":0") &&
-                                !body.contains("\"auth\": 0")
-                        if (valido) urlBase else null
-                    } else null
-                }
-            } catch (e: Exception) { return null }
-
-            if (resultado != null) {
-                UaHelper.lembrar(host, ua)
-                return resultado
+        return try {
+            val request = Request.Builder()
+                .url("$urlSemBarra/player_api.php?username=$user&password=$pass")
+                .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
+                .header("Accept-Language", "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7")
+                .build()
+            httpClient.newCall(request).execute().use { response ->
+                if (response.isSuccessful) {
+                    val body = response.body?.string() ?: ""
+                    val valido = body.contains("user_info") &&
+                            body.contains("server_info") &&
+                            !body.contains("\"auth\":0") &&
+                            !body.contains("\"auth\": 0")
+                    if (valido) urlBase else null
+                } else null
             }
-            if (codigo == 403 || codigo == 406) continue
-            return null
-        }
-        return null
+        } catch (e: Exception) { null }
     }
 
     private fun normalizarBaseUrl(dns: String): String {
@@ -1501,7 +1444,14 @@ class SettingsActivity : AppCompatActivity() {
         val cor    = Color.parseColor(corHex)
 
         tvNomePlano.text     = info.nomePlano
-        tvValidadePlano.text = info.dataFormatada
+
+        // ✅ NOVO: além do nome do plano (linha acima), mostra quanto tempo
+        // falta, ex.: "Válido até 10/03/2027 • Vence em 5 meses". Vitalício
+        // não tem "vence em", então fica só "Vitalício". O texto vem pronto
+        // de PlanoUtils (tempoRestante), então a regra mora num lugar só.
+        tvValidadePlano.text =
+            if (info.isVitalicio || info.tempoRestante.isBlank()) info.dataFormatada
+            else "${info.dataFormatada} • ${info.tempoRestante}"
 
         tvPlanoBadge.visibility = View.VISIBLE
         tvPlanoBadge.text = when {
