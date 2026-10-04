@@ -333,8 +333,27 @@ object SyncManager {
             // backend quando o Room LOCAL ainda estiver vazio — o resto do
             // fluxo (get_vod_streams/get_series direto no Xtream) continua
             // exatamente como sempre funcionou pra quem já tem o catálogo.
+            //
+            // ✅ CORRIGIDO (Home vazia/pela metade + Filmes/Séries levando ~1,5
+            // min pra popular na 1ª abertura): a condição antiga era só
+            // "Room vazio". Mas o LoginActivity.preCarregarLoteMinimo() grava
+            // 12 filmes + 12 séries no Room ANTES da Home abrir — então o Room
+            // nunca estava vazio aqui, o catálogo pronto da VPS era PULADO e
+            // o app caía no download pesado direto do Xtream (get_vod_streams/
+            // get_series). Agora o critério é "este aparelho ainda NUNCA
+            // completou uma sincronização completa pra esse usuário"
+            // (ultimaCompleta == 0, mesma chave que o pularDownloadCompleto já
+            // usa) — os 12 itens do login não contam como catálogo.
+            // Quem já tem catálogo completo e recente continua exatamente
+            // como antes (não baixa nada pesado da VPS toda abertura).
+            val prefsEstado = context.getSharedPreferences("vltv_sync_state", Context.MODE_PRIVATE)
+            val chaveUltimaCompleta = "ultima_sync_completa_" + user
+            val ultimaCompleta = prefsEstado.getLong(chaveUltimaCompleta, 0L)
+            val localSemCatalogoCompleto =
+                (vodsExistentes.isEmpty() && seriesExistentes.isEmpty()) || ultimaCompleta == 0L
+
             var catalogoBackend: HomeApiClient.CatalogoBackend? = null
-            if (vodsExistentes.isEmpty() && seriesExistentes.isEmpty()) {
+            if (localSemCatalogoCompleto) {
                 try {
                     catalogoBackend = HomeApiClient.buscarCatalogo(dns)
                 } catch (e: Exception) {
@@ -370,9 +389,8 @@ object SyncManager {
             //  2) Assim que filmes e séries estão gravados, a Home é
             //     avisada NA HORA (as 3 fileiras leem exatamente isso).
             //  3) Só no fim esperamos o Live terminar.
-            val prefsEstado = context.getSharedPreferences("vltv_sync_state", Context.MODE_PRIVATE)
-            val chaveUltimaCompleta = "ultima_sync_completa_" + user
-            val ultimaCompleta = prefsEstado.getLong(chaveUltimaCompleta, 0L)
+            // (prefsEstado / chaveUltimaCompleta / ultimaCompleta já foram
+            // lidos lá em cima, antes do buscarCatalogo — mesma leitura.)
             val pularDownloadCompleto = !forcar &&
                 catalogoBackend == null &&
                 vodsExistentes.isNotEmpty() && seriesExistentes.isNotEmpty() &&
