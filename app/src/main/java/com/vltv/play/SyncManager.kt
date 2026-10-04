@@ -17,6 +17,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONArray
 import org.json.JSONObject
 import okhttp3.HttpUrl.Companion.toHttpUrl
@@ -352,6 +353,29 @@ object SyncManager {
             val localSemCatalogoCompleto =
                 (vodsExistentes.isEmpty() && seriesExistentes.isEmpty()) || ultimaCompleta == 0L
 
+            // ✅ NOVO (abertura "instantânea" na 1ª instalação): enquanto o
+            // catálogo COMPLETO da VPS (~12 MB) baixa logo abaixo, pede um
+            // PACOTE INICIAL pequeno (GET /catalog/inicial: os itens mais
+            // recentes de cada categoria + tudo que tem selo) e já grava no
+            // Room + memória, avisando a Home. Roda em PARALELO com o
+            // buscarCatalogo e é esperado (com teto de 10s) antes de gravar o
+            // catálogo completo — assim as duas gravações nunca se
+            // atropelam. Se a VPS não responder, retorna sem fazer nada e o
+            // fluxo segue exatamente como antes.
+            val inicialJob = if (localSemCatalogoCompleto) {
+                scope.async {
+                    try {
+                        withTimeoutOrNull(10_000L) {
+                            aplicarPacoteInicial(db, dns, palavrasProibidas, vodsExistentes, seriesExistentes)
+                        }
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (e: Exception) {
+                        e.printStackTrace()
+                    }
+                }
+            } else null
+
             var catalogoBackend: HomeApiClient.CatalogoBackend? = null
             if (localSemCatalogoCompleto) {
                 try {
@@ -395,6 +419,10 @@ object SyncManager {
                 catalogoBackend == null &&
                 vodsExistentes.isNotEmpty() && seriesExistentes.isNotEmpty() &&
                 System.currentTimeMillis() - ultimaCompleta in 0L until JANELA_SYNC_COMPLETA_MS
+
+            // O pacote inicial precisa terminar de gravar antes do catálogo
+            // completo (que o sobrescreve com a versão inteira).
+            try { inicialJob?.await() } catch (e: Exception) { e.printStackTrace() }
 
             if (pularDownloadCompleto) {
                 // Banco local já está completo e recente: reaproveita e
@@ -615,6 +643,30 @@ object SyncManager {
             .addInterceptor(VpnInterceptor())
             .addInterceptor(DnsFailoverInterceptor())
             .build()
+    }
+
+    /**
+     * ✅ NOVO: aplica o PACOTE INICIAL do backend (poucos itens por
+     * categoria + itens com selo). Reaproveita sincronizarVod/sincronizarSeries
+     * (mesmo código do catálogo completo — grava no Room preservando os
+     * campos calculados), mas esses dois helpers deixam a memória só com os
+     * 200 mais recentes; por isso, depois deles, recarregamos a memória a
+     * partir do Room (que nesse momento ainda é pequeno: poucas centenas de
+     * itens), pra TODAS as categorias aparecerem nas abas. Depois avisa a
+     * Home. As abas de Filmes/Séries completam cada categoria sozinhas em
+     * segundo plano (atualizarEmBackground), como já faziam.
+     */
+    private suspend fun aplicarPacoteInicial(
+        db: AppDatabase, dns: String, palavrasProibidas: List<String>,
+        vodsExistentes: Map<Int, VodEntity>, seriesExistentes: Map<Int, SeriesEntity>
+    ) {
+        val pacote = HomeApiClient.buscarCatalogoInicial(dns) ?: return
+        sincronizarVod(db, pacote.vodArray, palavrasProibidas, vodsExistentes)
+        sincronizarSeries(db, pacote.seriesArray, palavrasProibidas, seriesExistentes)
+        ContentRepository.atualizarVods(db.streamDao().getAllVods())
+        ContentRepository.atualizarSeries(db.streamDao().getAllSeries())
+        Log.d("SyncManager", "⚡ pacote inicial aplicado: ${pacote.vodArray.length()} filmes, ${pacote.seriesArray.length()} séries")
+        notificarOuvintes()
     }
 
     private fun baixarJsonXtream(dns: String, user: String, pass: String, action: String): String {
