@@ -73,6 +73,12 @@ object HomeApiClient {
     // (sem processamento do lado do backend), então tende a ser rápido.
     private const val CATALOG_TIMEOUT_MS = 25_000
 
+    // ✅ NOVO: o pacote inicial (/catalog/inicial) é pequeno (algumas
+    // centenas de itens por painel) — leitura curta de propósito: se a VPS
+    // estiver lenta, melhor desistir rápido e seguir o fluxo normal do que
+    // segurar a Home esperando um "atalho".
+    private const val INICIAL_TIMEOUT_MS = 8_000
+
     // ✅ NOVO: /credits é um JSON minúsculo e roda durante a reprodução —
     // timeout curto pra nunca segurar nada se a VPS estiver lenta.
     private const val CREDITS_TIMEOUT_MS = 6_000
@@ -215,6 +221,43 @@ object HomeApiClient {
             // (ex.: cadastrado mas nunca recebeu upload de verdade) não
             // vale a pena tratar como catálogo pronto — deixa o
             // SyncManager cair pro Xtream normalmente.
+            if (vodArray.length() == 0 && seriesArray.length() == 0) return@withContext null
+
+            CatalogoBackend(vodArray, seriesArray)
+        } catch (e: Exception) {
+            e.printStackTrace()
+            null
+        } finally {
+            conn?.disconnect()
+        }
+    }
+
+    /**
+     * ✅ NOVO: busca o PACOTE INICIAL do backend (GET /catalog/inicial) — só
+     * os itens mais recentes de CADA categoria + todos os itens com selo
+     * (Top10, Novidades, Nova Temporada...). É o que faz a Home e as abas de
+     * Filmes/Séries abrirem "cheias" na 1ª instalação, enquanto o catálogo
+     * COMPLETO (buscarCatalogo) baixa em segundo plano. Os itens têm o mesmo
+     * formato do /catalog, então o SyncManager processa com o mesmo código.
+     *
+     * Retorna null se o backend não conhecer o painel ainda, estiver fora do
+     * ar ou vier vazio — nesse caso nada muda: o fluxo normal segue como
+     * sempre foi (nenhum comportamento depende deste pacote).
+     */
+    suspend fun buscarCatalogoInicial(dns: String): CatalogoBackend? = withContext(Dispatchers.IO) {
+        var conn: HttpURLConnection? = null
+        try {
+            val urlDomain = URLEncoder.encode(dns, "UTF-8")
+            conn = (URL("$BASE_URL/catalog/inicial?domain=$urlDomain").openConnection() as HttpURLConnection).apply {
+                requestMethod = "GET"
+                connectTimeout = CONNECT_TIMEOUT_MS
+                readTimeout = INICIAL_TIMEOUT_MS
+            }
+            if (conn.responseCode != 200) return@withContext null
+
+            val json = JSONObject(conn.inputStream.bufferedReader().use { it.readText() })
+            val vodArray = json.optJSONArray("vod_streams") ?: JSONArray()
+            val seriesArray = json.optJSONArray("series_streams") ?: JSONArray()
             if (vodArray.length() == 0 && seriesArray.length() == 0) return@withContext null
 
             CatalogoBackend(vodArray, seriesArray)
