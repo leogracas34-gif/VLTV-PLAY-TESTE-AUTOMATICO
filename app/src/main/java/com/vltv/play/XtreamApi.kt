@@ -40,7 +40,9 @@ data class UserInfo(
     val max_connections: String?,
     val active_cons: String?,
     val created_at: String?,
-    val is_trial: String?
+    val is_trial: String?,
+    // Código do painel (vem do gateway). Nunca é o DNS real.
+    val vltv_painel: String? = null
 )
 data class ServerInfo(val url: String?, val port: String?, val server_protocol: String?)
 
@@ -267,182 +269,21 @@ class VpnInterceptor : Interceptor {
 }
 
 // ---------------------
-// Interceptor de Failover automático de DNS
+// Interceptor de rede
 // ---------------------
-// Se a chamada falhar no DNS atual (erro de rede ou resposta de erro de
-// servidor), tenta os outros DNS, um por um, mantendo o mesmo caminho e
-// os mesmos parâmetros (username/password/action). No primeiro que
-// responder com sucesso, essa resposta é devolvida pro app normalmente e
-// esse DNS passa a ser o novo "ativo" (persistido).
-//
-// ✅ CORREÇÃO (logout / DNS trocado sozinho): antes, qualquer servidor
-// reserva que respondesse HTTP 200 era aceito — mesmo um painel onde o
-// usuário NÃO existe (que responde 200 com "auth":0). Agora, antes de
-// aceitar um servidor reserva, o interceptor confirma com uma chamada de
-// login que o usuário/senha realmente são aceitos ali. Espelhos do mesmo
-// painel continuam funcionando normalmente como failover; painéis de
-// outros servidores são ignorados e nunca viram o DNS ativo.
-//
-// ✅ MELHORIAS desta versão:
-//  1) Só dispara failover quando o erro indica problema DO SERVIDOR/DNS
-//     (exceção de rede, 5xx, 403, 404, 408, 429). Antes, qualquer código
-//     não-2xx (ex.: 400/401) rodava até 3 reservas à toa, deixando a
-//     tela lenta sem nenhuma chance de melhorar.
-//  2) Quando TODOS falham, devolve o erro ORIGINAL que já tinha ocorrido
-//     em vez de repetir a requisição original uma 3ª vez (antes eram
-//     até 15s de connect timeout a mais pro usuário esperar).
-//  3) A validação de login do servidor reserva fica em cache por 60s —
-//     várias chamadas seguidas durante uma queda não refazem o login
-//     de validação a cada uma.
-//  4) Quando a conexão falha com o IP que o DNS do sistema deu, avisa o
-//     SmartDns pra tentar o DoH primeiro nesse domínio (cobre IP falso/
-//     bloqueado pela operadora).
+// Antes trocava de DNS de origem quando um falhava. Agora o app só conhece o
+// gateway da VPS (tv.vltvplay.tech), que faz o failover entre os DNS reais do
+// lado de lá. Aqui só resta avisar o SmartDns quando a conexão falha, para a
+// próxima resolução tentar o DoH primeiro.
 class DnsFailoverInterceptor : Interceptor {
-
-    companion object {
-        // Antes: percorria TODOS os servidores da lista (até ~20), um por
-        // um, cada um podendo gastar o timeout inteiro de conexão. Agora
-        // tenta no máximo 3 reservas, com timeout curto de conexão.
-        private const val MAX_TENTATIVAS_RESERVA = 3
-        private const val CONNECT_TIMEOUT_RESERVA_S = 8
-        private const val VALIDACAO_TTL_MS = 60_000L
-        private val REGEX_AUTH_ZERO = Regex("\"auth\"\\s*:\\s*\"?0\"?")
-
-        // "host|usuario" -> momento em que o login foi confirmado.
-        private val validados = ConcurrentHashMap<String, Long>()
-
-        // Códigos que indicam problema do servidor/espelho (vale tentar outro).
-        // 400/401 etc. são erro do pedido/conta: outro espelho não resolve.
-        private fun codigoPedeFailover(code: Int): Boolean =
-            code >= 500 || code == 403 || code == 404 || code == 408 || code == 429
-    }
-
     override fun intercept(chain: Interceptor.Chain): Response {
         val original = chain.request()
-        val hostAtual = original.url.host
-
-        // Guardamos a 1ª falha pra devolver no fim se nenhum reserva servir.
-        var falhaHttp: Response? = null
-        var falhaIo: IOException? = null
-
-        // 1ª tentativa: DNS atual
-        try {
-            val response = chain.proceed(original)
-            if (response.isSuccessful || !codigoPedeFailover(response.code)) return response
-            // ✅ CORREÇÃO (IllegalStateException "previous response is still
-            // open"): o OkHttp NÃO deixa fazer outra chamada na mesma chain
-            // enquanto a resposta anterior estiver aberta. Antes ela ficava
-            // aberta aqui pra devolver no fim, e o primeiro reserva já
-            // quebrava. Agora o corpo (página de erro, pequena) é copiado
-            // pra memória, a resposta original é FECHADA, e devolvemos uma
-            // cópia equivalente se nenhum reserva funcionar.
-            val corpoEmMemoria = response.peekBody(1024L * 1024L)
-            falhaHttp = response.newBuilder().body(corpoEmMemoria).build()
-            response.close()
+        return try {
+            chain.proceed(original)
         } catch (e: IOException) {
-            falhaIo = e
-            // IP do sistema pode estar falso/bloqueado: próxima resolução
-            // desse domínio tenta o DoH primeiro.
-            XtreamApi.dnsSugerirDoh(hostAtual)
+            XtreamApi.dnsSugerirDoh(original.url.host)
+            throw e
         }
-
-        // ✅ Se o dns_config.json diz a qual LÂMINA (mesmo painel) o DNS
-        // atual pertence, o failover tenta SÓ os DNS irmãos dessa lâmina,
-        // na ordem do arquivo. Eles são o mesmo painel, então o
-        // usuário/senha já vale neles — não precisa testar login em
-        // painel nenhum. Se o DNS não estiver em nenhuma lâmina
-        // (irmaos == null), cai no comportamento de percorrer SERVERS.
-        val irmaos = DnsConfig.irmaos(hostAtual)
-        val candidatos: List<String> = irmaos ?: XtreamApi.SERVERS
-        val precisaValidar = irmaos == null
-
-        var tentativasReserva = 0
-
-        for (servidor in candidatos) {
-            val servidorUrl = try { servidor.toHttpUrl() } catch (e: Exception) { continue }
-            if (servidorUrl.host == hostAtual) continue
-            if (precisaValidar) {
-                if (tentativasReserva >= MAX_TENTATIVAS_RESERVA) break
-                tentativasReserva++
-            }
-
-            val novaUrl = original.url.newBuilder()
-                .scheme(servidorUrl.scheme)
-                .host(servidorUrl.host)
-                .port(servidorUrl.port)
-                .build()
-
-            // ✅ Só aceita servidor de OUTRA lista se ele reconhecer o
-            // usuário/senha. Se não reconhecer, ignora e tenta o próximo.
-            if (precisaValidar && !usuarioAceitoNoServidor(chain, original, novaUrl)) continue
-
-            try {
-                val response = chain
-                    .withConnectTimeout(CONNECT_TIMEOUT_RESERVA_S, TimeUnit.SECONDS)
-                    .proceed(original.newBuilder().url(novaUrl).build())
-                if (response.isSuccessful) {
-                    // Esse DNS respondeu E aceita o usuário — vira o novo
-                    // DNS ativo do app
-                    falhaHttp?.close()
-                    XtreamApi.atualizarDnsAtivo(servidorUrl.toString() + "/")
-                    return response
-                }
-                response.close()
-            } catch (e: IOException) {
-                if (falhaIo == null) falhaIo = e
-                // tenta o próximo
-            }
-        }
-
-        // Nenhum reserva respondeu — devolve o erro original (sem refazer
-        // a requisição à toa).
-        falhaHttp?.let { return it }
-        throw falhaIo ?: IOException("Nenhum servidor respondeu")
-    }
-
-    // Faz uma chamada de login (player_api.php sem "action") no servidor
-    // reserva e confirma que ele conhece o usuário. Devolve false se o
-    // servidor não responde, responde erro, não devolve user_info ou
-    // devolve "auth":0 (usuário inexistente naquele painel).
-    private fun usuarioAceitoNoServidor(
-        chain: Interceptor.Chain,
-        original: Request,
-        novaUrl: HttpUrl
-    ): Boolean {
-        val user = original.url.queryParameter("username")
-        val pass = original.url.queryParameter("password")
-        // Chamada sem credenciais na URL: não tem como validar, mantém
-        // o comportamento antigo.
-        if (user.isNullOrBlank() || pass.isNullOrBlank()) return true
-
-        // ✅ Cache de validação (só guarda host+usuário, nunca a senha).
-        val chaveCache = "${novaUrl.host}|$user"
-        val agora = System.currentTimeMillis()
-        val ultimo = validados[chaveCache]
-        if (ultimo != null && agora - ultimo < VALIDACAO_TTL_MS) return true
-
-        val aceito = try {
-            val urlLogin = novaUrl.newBuilder()
-                .query(null)
-                .addQueryParameter("username", user)
-                .addQueryParameter("password", pass)
-                .build()
-            val reqLogin = original.newBuilder().url(urlLogin).build()
-
-            chain
-                .withConnectTimeout(CONNECT_TIMEOUT_RESERVA_S, TimeUnit.SECONDS)
-                .proceed(reqLogin)
-                .use { r ->
-                    if (!r.isSuccessful) return@use false
-                    val corpo = r.body?.string().orEmpty()
-                    corpo.contains("user_info") && !REGEX_AUTH_ZERO.containsMatchIn(corpo)
-                }
-        } catch (e: Exception) {
-            false
-        }
-
-        if (aceito) validados[chaveCache] = agora
-        return aceito
     }
 }
 
@@ -550,71 +391,17 @@ class SmartDns(private val resolvedoresDoh: List<Dns>) : Dns {
 }
 
 // ---------------------
-// ✅ NOVO: DnsConfig — lista de DNS controlada pela VPS
+// DnsConfig — só o gateway
 // ---------------------
-// A lista de servidores agora mora no arquivo dns_config.json da VPS
-// (https://vltvplay.tech/dns_config.json). Pra trocar/remover/adicionar
-// um DNS, basta editar esse arquivo na VPS — o app baixa a lista nova
-// sozinho (ao abrir e antes de cada login), sem precisar recompilar.
-//
-// Ordem de prioridade da lista usada pelo app:
-//   1) última lista baixada da VPS (guardada no aparelho)
-//   2) FALLBACK abaixo — só vale na 1ª abertura do app sem internet ou
-//      se a VPS estiver fora do ar. Mesmo assim, a lista baixada uma vez
-//      continua valendo nas próximas aberturas.
+// Não existe mais lista de DNS no app nem download de dns_config.json.
+// Os DNS reais dos servidores ficam escondidos na VPS (gateway).
 object DnsConfig {
 
-    private const val CONFIG_URL = "https://vltvplay.tech/dns_config.json"
-    private const val PREFS_NAME = "vltv_dns_config"
-    private const val KEY_JSON = "servers_json"
-    private const val INTERVALO_MIN_MS = 60_000L
+    // Para trocar o endereço do gateway, mude só aqui.
+    const val GATEWAY_URL = "https://tv.vltvplay.tech"
 
-    // Lista de emergência embutida no app (mesma que está hoje na VPS).
-    private val FALLBACK = listOf(
-        "http://fibercdn.sbs",
-        "http://ranos.sbs",
-        "http://cmdtv.casa",
-        "http://cmdtv.pro",
-        "http://cmdtv.sbs",
-        "http://cmdtv.top",
-        "http://cmdbr.life",
-        "http://supertv.red",
-        "http://kodexk.click",
-        "http://maisplaytech.space",
-        "http://pthdtv.sbs",
-        "http://pthdtv.top",
-        "http://cdnsec.cyou",
-        "http://fx12.sbs",
-        "http://anotaai.lol",
-        "http://brtx.beauty",
-        "http://fuiali.vip",
-        "http://dogshow.club",
-        "http://cdnsec.click",
-        "http://sivimcdn.click",
-        "http://cybertronplay.space"
-    )
-
-    // Client próprio e simples (sem DoH, sem failover) — só pra baixar o
-    // JSON do próprio site. Timeouts curtos pra nunca atrasar o login.
-    // ✅ CORREÇÃO: User-Agent trocado pro mesmo Chrome completo usado no
-    // resto do app — mesmo sendo uma chamada pro próprio servidor (VPS),
-    // manter o padrão evita qualquer bloqueio por UA incompleto caso o
-    // domínio vltvplay.tech passe a ter regra de UA no futuro (ex.: atrás
-    // de um proxy/CDN/WAF).
-    private val client: OkHttpClient by lazy {
-        OkHttpClient.Builder()
-            .connectTimeout(5, TimeUnit.SECONDS)
-            .readTimeout(5, TimeUnit.SECONDS)
-            .callTimeout(8, TimeUnit.SECONDS)
-            .retryOnConnectionFailure(false)
-            .build()
-    }
-
-    @Volatile private var cache: List<String>? = null
-    // ✅ NOVO: lâminas do dns_config.json (cada lâmina = lista de DNS do
-    // MESMO painel). Vem de servidores[].laminas[].dns.
-    @Volatile private var laminas: List<List<String>>? = null
-    @Volatile private var ultimoRefreshOk = 0L
+    private const val PREFS_ANTIGO = "vltv_dns_config"
+    @Volatile private var limpou = false
 
     private fun getAppContext(): Context? {
         return try {
@@ -624,116 +411,26 @@ object DnsConfig {
         } catch (e: Exception) { null }
     }
 
-    // Lê e valida o JSON.
-    // ✅ CORREÇÃO: o arquivo da VPS agora é {"versao": 2, "dns": [...]}
-    // e o app só lia a chave "servers" — então ignorava o arquivo novo e
-    // ficava com a lista antiga embutida (FALLBACK). Agora aceita as duas
-    // chaves: "dns" (formato novo) e "servers" (formato antigo).
-    private fun parse(raw: String): List<String>? {
-        return try {
-            val obj = JSONObject(raw)
-            val arr = obj.optJSONArray("dns")
-                ?: obj.optJSONArray("servers")
-                ?: return null
-            val lista = mutableListOf<String>()
-            for (i in 0 until arr.length()) {
-                val s = arr.optString(i, "").trim()
-                if (s.startsWith("http://") || s.startsWith("https://")) lista.add(s)
-            }
-            lista.distinct().takeIf { it.isNotEmpty() }
-        } catch (e: Exception) { null }
+    // Apaga a lista de DNS que versões antigas guardaram no aparelho.
+    private fun limparListaAntiga() {
+        if (limpou) return
+        val ctx = getAppContext() ?: return
+        try {
+            ctx.getSharedPreferences(PREFS_ANTIGO, Context.MODE_PRIVATE).edit().clear().apply()
+            limpou = true
+        } catch (e: Exception) { /* ignora */ }
     }
 
-    // ✅ NOVO: lê as lâminas do JSON ({"servidores":[{"laminas":[{"dns":[...]}]}]}).
-    private fun parseLaminas(raw: String): List<List<String>> {
-        return try {
-            val servidores = JSONObject(raw).optJSONArray("servidores") ?: return emptyList()
-            val out = mutableListOf<List<String>>()
-            for (i in 0 until servidores.length()) {
-                val lams = servidores.optJSONObject(i)?.optJSONArray("laminas") ?: continue
-                for (j in 0 until lams.length()) {
-                    val dnsArr = lams.optJSONObject(j)?.optJSONArray("dns") ?: continue
-                    val lista = mutableListOf<String>()
-                    for (k in 0 until dnsArr.length()) {
-                        val u = dnsArr.optString(k, "").trim()
-                        if (u.startsWith("http://") || u.startsWith("https://")) lista.add(u)
-                    }
-                    if (lista.isNotEmpty()) out.add(lista)
-                }
-            }
-            out
-        } catch (e: Exception) { emptyList() }
-    }
-
-    private fun hostDe(url: String): String? =
-        try { url.toHttpUrl().host } catch (e: Exception) { null }
-
-    // ✅ NOVO: devolve os OUTROS DNS da mesma lâmina do host informado, na
-    // ordem do arquivo. Devolve null se o host não está em nenhuma lâmina
-    // (ou se o app ainda não tem as lâminas) — aí vale o comportamento
-    // antigo do failover.
-    fun irmaos(host: String): List<String>? {
-        servers() // garante que a lista salva já foi carregada
-        val todas = laminas ?: return null
-        val alvo = host.lowercase()
-        val lamina = todas.firstOrNull { l -> l.any { hostDe(it) == alvo } } ?: return null
-        return lamina.filter { hostDe(it) != alvo }
-    }
-
-    // Lista atual — rápida, sem rede. Sempre devolve algo utilizável.
     fun servers(): List<String> {
-        cache?.let { return it }
-
-        val raw = try {
-            getAppContext()
-                ?.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-                ?.getString(KEY_JSON, null)
-        } catch (e: Exception) { null }
-        val salva = raw?.let { parse(it) }
-
-        if (salva != null) {
-            // ✅ Ordem trocada: lâminas ANTES do cache. Quem lê "cache"
-            // pronto e chama irmaos() agora nunca pega lâminas vazias.
-            laminas = parseLaminas(raw)
-            cache = salva
-            return salva
-        }
-        return FALLBACK
+        limparListaAntiga()
+        return listOf(GATEWAY_URL)
     }
 
-    // Baixa a lista da VPS. BLOQUEANTE (chamar em thread de fundo/IO).
-    // Devolve true se a lista está atualizada. Se a VPS não responder ou
-    // devolver algo inválido, mantém a lista que já estava valendo.
-    // Não baixa de novo se já deu certo há menos de 1 minuto.
-    @Synchronized
-    fun refresh(context: Context, force: Boolean = false): Boolean {
-        val agora = System.currentTimeMillis()
-        if (!force && agora - ultimoRefreshOk < INTERVALO_MIN_MS) return true
+    // Não há mais "irmãos": o gateway cuida disso.
+    fun irmaos(host: String): List<String>? = null
 
-        return try {
-            val request = Request.Builder()
-                .url(CONFIG_URL)
-                .header("Cache-Control", "no-cache")
-                .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
-                .build()
-
-            client.newCall(request).execute().use { response ->
-                if (!response.isSuccessful) return false
-                val raw = response.body?.string().orEmpty()
-                val lista = parse(raw) ?: return false
-
-                context.applicationContext
-                    .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-                    .edit().putString(KEY_JSON, raw).apply()
-
-                // ✅ lâminas antes do cache (mesmo motivo de servers())
-                laminas = parseLaminas(raw)
-                cache = lista
-                ultimoRefreshOk = agora
-                true
-            }
-        } catch (e: Exception) { false }
-    }
+    // Mantida para as telas que ainda chamam: não há nada para baixar.
+    fun refresh(context: Context, force: Boolean = false): Boolean = true
 }
 
 // ---------------------
@@ -826,29 +523,47 @@ object XtreamApi {
         } catch (e: Exception) { null }
     }
 
+    const val PREF_PAINEL_KEY = "vltv_painel"
+    val GATEWAY_BASE: String get() = DnsConfig.GATEWAY_URL + "/"
+
+    // Quem já estava logado com um DNS real salvo é migrado para o gateway
+    // na primeira abertura (sem precisar entrar de novo).
     private fun carregarDnsSalvo() {
         val context = getAppContext() ?: return
         val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         val savedDns = prefs.getString(PREF_DNS_KEY, null)
-        if (!savedDns.isNullOrBlank()) setBaseUrl(savedDns)
+        if (!savedDns.isNullOrBlank()) {
+            if (savedDns != GATEWAY_BASE) prefs.edit().putString(PREF_DNS_KEY, GATEWAY_BASE).apply()
+            setBaseUrl(GATEWAY_BASE)
+        }
     }
 
+    // O parâmetro "dns" é ignorado de propósito: o app só fala com o gateway.
     fun salvarDns(context: Context, dns: String) {
         context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-            .edit().putString(PREF_DNS_KEY, dns).apply()
-        setBaseUrl(dns)
+            .edit().putString(PREF_DNS_KEY, GATEWAY_BASE).apply()
+        setBaseUrl(GATEWAY_BASE)
     }
 
-    // ✅ Chamado automaticamente pelo DnsFailoverInterceptor quando um DNS
-    // de reserva responde com sucesso. Persiste esse DNS como o novo
-    // ativo, igual ao salvarDns, mas sem precisar de login novo.
-    fun atualizarDnsAtivo(novoDns: String) {
-        val context = getAppContext()
-        if (context != null) {
-            context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-                .edit().putString(PREF_DNS_KEY, novoDns).apply()
-        }
-        setBaseUrl(novoDns)
+    // Antes o failover trocava o DNS ativo. Agora não há o que trocar.
+    fun atualizarDnsAtivo(novoDns: String) { /* gateway fixo */ }
+
+    // Código do painel do cliente (vem do login no gateway). É o que o app
+    // manda ao backend (Top 10, créditos, catálogo) no lugar do DNS real.
+    fun salvarPainel(context: Context, painel: String) {
+        if (painel.isBlank()) return
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit().putString(PREF_PAINEL_KEY, painel).apply()
+    }
+
+    fun painelSalvo(context: Context): String =
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .getString(PREF_PAINEL_KEY, "") ?: ""
+
+    // Use este valor onde o app mandava o DNS para o backend (/home, /catalog, /credits).
+    fun dominioBackend(context: Context): String {
+        val p = painelSalvo(context)
+        return if (p.isNotBlank()) "painel:$p" else GATEWAY_BASE
     }
 
     // ✅ Monta e valida a URL antes de aplicar — evita salvar/usar uma
@@ -861,18 +576,8 @@ object XtreamApi {
     fun setBaseUrl(newUrl: String) {
         if (newUrl.isBlank()) return
 
-        var urlClean = newUrl.trim()
-        if (urlClean.contains("player_api.php")) urlClean = urlClean.substringBefore("player_api.php")
-        if (!urlClean.startsWith("http://") && !urlClean.startsWith("https://")) urlClean = "http://$urlClean"
-        if (!urlClean.endsWith("/")) urlClean += "/"
-
-        val urlValida = try {
-            urlClean.toHttpUrl()
-            true
-        } catch (e: Exception) {
-            false
-        }
-        if (!urlValida) return
+        // Qualquer valor recebido vira o gateway.
+        val urlClean = GATEWAY_BASE
 
         synchronized(lock) {
             if (baseUrl != urlClean) {

@@ -89,6 +89,9 @@ class LoginActivity : AppCompatActivity() {
     @Volatile private var contaExpiradaDetectada = false
     @Volatile private var contaExpiradaEhTeste = false
 
+    // Código do painel devolvido pelo gateway no login (nunca é DNS real).
+    @Volatile private var painelDetectado: String? = null
+
     override fun onCreate(savedInstanceState: Bundle?) {
         // ✅ REMOVIDO: installSplashScreen() saiu daqui. A LoginActivity não
         // é mais a porta de entrada do app — quem cobre esse papel agora é
@@ -140,7 +143,12 @@ class LoginActivity : AppCompatActivity() {
         val prefs     = getSharedPreferences("vltv_prefs", Context.MODE_PRIVATE)
         val savedUser = prefs.getString("username", null)
         val savedPass = prefs.getString("password", null)
-        val savedDns  = prefs.getString("dns", null)
+        // Quem estava logado com DNS real salvo é migrado para o gateway.
+        val savedDnsBruto = prefs.getString("dns", null)
+        val savedDns = if (savedDnsBruto.isNullOrBlank()) null else XtreamApi.GATEWAY_BASE
+        if (savedDns != null && savedDnsBruto != savedDns) {
+            prefs.edit().putString("dns", savedDns).apply()
+        }
 
         // ✅ NOVO: distingue "nunca teve login" (1ª instalação de verdade,
         // pode gerar teste automático) de "saiu da conta pelo botão de
@@ -388,6 +396,9 @@ class LoginActivity : AppCompatActivity() {
         lifecycleScope.launch(Dispatchers.IO) {
             XtreamApi.setBaseUrl(dns)
 
+            // Quem já estava logado ainda não tem o código do painel: busca uma vez.
+            launch(Dispatchers.IO) { garantirPainel(dns, user, pass) }
+
             val db = AppDatabase.getDatabase(applicationContext)
             val temConteudo = db.streamDao().getVodCount() > 0
 
@@ -517,6 +528,7 @@ class LoginActivity : AppCompatActivity() {
         lifecycleScope.launch(Dispatchers.IO) {
             contaExpiradaDetectada = false
             contaExpiradaEhTeste = false
+            painelDetectado = null
 
             // ✅ NOVO: garante a lista de DNS mais recente da VPS antes de
             // testar os servidores (não baixa de novo se já baixou há
@@ -651,6 +663,10 @@ class LoginActivity : AppCompatActivity() {
                         ).containsMatchIn(body)
                         contaExpiradaDetectada = true
                     }
+
+                    painelDetectado = Regex("\"vltv_painel\"\\s*:\\s*\"([^\"]*)\"")
+                        .find(body)?.groupValues?.get(1)?.takeIf { it.isNotBlank() }
+                        ?: painelDetectado
 
                     val valido = body.contains("user_info") &&
                             body.contains("server_info") &&
@@ -853,6 +869,16 @@ class LoginActivity : AppCompatActivity() {
             apply()
         }
         XtreamApi.salvarDns(this, dns)
+        painelDetectado?.let { XtreamApi.salvarPainel(this, it) }
+    }
+
+    // Busca o código do painel para quem já estava logado antes do gateway.
+    private fun garantirPainel(dns: String, user: String, pass: String) {
+        if (XtreamApi.painelSalvo(this).isNotBlank()) return
+        val base = normalizarBaseUrl(dns)
+        val json = buscarJsonLimitado("${base}player_api.php?username=$user&password=$pass", 60_000) ?: return
+        val p = Regex("\"vltv_painel\"\\s*:\\s*\"([^\"]*)\"").find(json)?.groupValues?.get(1)
+        if (!p.isNullOrBlank()) XtreamApi.salvarPainel(this, p)
     }
 
     // ✅ COMPORTAMENTO (estilo Netflix), usando SessionManager:

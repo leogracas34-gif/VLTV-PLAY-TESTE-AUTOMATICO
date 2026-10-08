@@ -131,6 +131,9 @@ class SettingsActivity : AppCompatActivity() {
         .retryOnConnectionFailure(false)
         .build()
 
+    // Código do painel devolvido pelo gateway ao validar o novo login.
+    @Volatile private var painelDetectado: String? = null
+
     private val clientLento = OkHttpClient.Builder()
         .connectTimeout(25, TimeUnit.SECONDS)
         .readTimeout(25, TimeUnit.SECONDS)
@@ -1216,6 +1219,7 @@ class SettingsActivity : AppCompatActivity() {
             // testar os servidores (não baixa de novo se já baixou há
             // menos de 1 minuto, e nunca demora mais que ~8s).
             DnsConfig.refresh(applicationContext)
+            painelDetectado = null
 
             var dnsVencedor: String? = null
             try {
@@ -1280,6 +1284,10 @@ class SettingsActivity : AppCompatActivity() {
             httpClient.newCall(request).execute().use { response ->
                 if (response.isSuccessful) {
                     val body = response.body?.string() ?: ""
+                    painelDetectado = Regex("\"vltv_painel\"\\s*:\\s*\"([^\"]*)\"")
+                        .find(body)?.groupValues?.get(1)?.takeIf { it.isNotBlank() }
+                        ?: painelDetectado
+
                     val valido = body.contains("user_info") &&
                             body.contains("server_info") &&
                             !body.contains("\"auth\":0") &&
@@ -1359,6 +1367,7 @@ class SettingsActivity : AppCompatActivity() {
                     .putString("dns",      novoDns)
                     .putString("username", novoUsuario)
                     .putString("password", novaSenha)
+                    .putString("vltv_painel", painelDetectado ?: "")
                     .putBoolean("logout_requested", false)
                     .commit()
                 XtreamApi.salvarDns(applicationContext, novoDns)
