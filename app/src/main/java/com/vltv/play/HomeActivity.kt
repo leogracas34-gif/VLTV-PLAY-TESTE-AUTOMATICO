@@ -77,6 +77,11 @@ class HomeActivity : AppCompatActivity() {
     private lateinit var binding: ActivityHomeBinding
     private val TMDB_API_KEY = TmdbConfig.API_KEY
 
+    // ✅ Selos dos cards (Novidade / Nova temporada / Novo episódio / Em breve):
+    // ligado/desligado pelo painel /admin do gateway (GET /config). O último
+    // valor fica guardado no aparelho; sem resposta do gateway, usa ele.
+    @Volatile private var selosAtivos: Boolean = true
+
     private var currentProfile: String = "Padrao"
     private var currentProfileIcon: String? = null
 
@@ -233,6 +238,28 @@ class HomeActivity : AppCompatActivity() {
         }
     }
 
+    // Pergunta ao gateway se os selos estão ligados. Se mudou, grava e redesenha a Home.
+    private fun atualizarConfigSelos() {
+        lifecycleScope.launch(Dispatchers.IO) {
+            try {
+                val base = getSharedPreferences("vltv_prefs", Context.MODE_PRIVATE)
+                    .getString("dns", "")?.trim()?.removeSuffix("/") ?: ""
+                if (base.isEmpty()) return@launch
+                val novo = JSONObject(fetchUrlComTimeout("$base/config", 8000)).optBoolean("selos", true)
+                if (novo != selosAtivos) {
+                    selosAtivos = novo
+                    getSharedPreferences("vltv_home_prefs", Context.MODE_PRIVATE)
+                        .edit().putBoolean("selos_ativos", novo).apply()
+                    withContext(Dispatchers.Main) {
+                        if (!isFinishing && !isDestroyed) popularTelaDoRepositorio()
+                    }
+                }
+            } catch (e: Exception) {
+                // sem resposta: mantém o último valor guardado
+            }
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
@@ -259,6 +286,9 @@ class HomeActivity : AppCompatActivity() {
 
             val windowInsetsController = WindowCompat.getInsetsController(window, window.decorView)
             windowInsetsController.isAppearanceLightStatusBars = false
+
+            selosAtivos = getSharedPreferences("vltv_home_prefs", Context.MODE_PRIVATE)
+                .getBoolean("selos_ativos", true)
 
             setupSingleBanner()
             setupBottomNavigation()
@@ -298,6 +328,7 @@ class HomeActivity : AppCompatActivity() {
             }
             SyncManager.sincronizarSeNecessario(applicationContext)
             SyncManager.iniciarSyncPeriodica(applicationContext)
+            atualizarConfigSelos()
 
         } catch (e: Exception) {
             e.printStackTrace()
@@ -1597,7 +1628,7 @@ class HomeActivity : AppCompatActivity() {
         streamIcon = stream_icon ?: "",
         isSerie = false,
         isTop10 = is_top10 == 1,
-        isNovidade = is_novidade == 1,
+        isNovidade = selosAtivos && is_novidade == 1,
         logoUrl = logo_url
     )
 
@@ -1610,12 +1641,12 @@ class HomeActivity : AppCompatActivity() {
             streamIcon = cover ?: "",
             isSerie = true,
             isTop10 = is_top10 == 1,
-            isNovidade = is_novidade == 1,
-            isNovaTemporada = is_nova_temporada == 1 && dentroDaJanela,
-            isNovoEpisodio = is_novo_episodio == 1 && dentroDaJanela,
-            isNovaTemporadaEmBreve = !tmdb_proxima_temporada_data.isNullOrEmpty() &&
+            isNovidade = selosAtivos && is_novidade == 1,
+            isNovaTemporada = selosAtivos && is_nova_temporada == 1 && dentroDaJanela,
+            isNovoEpisodio = selosAtivos && is_novo_episodio == 1 && dentroDaJanela,
+            isNovaTemporadaEmBreve = selosAtivos && !tmdb_proxima_temporada_data.isNullOrEmpty() &&
                 tmdb_proxima_temporada_data > hoje,
-            isNovoEpisodioEmBreve = !tmdb_proximo_episodio_data.isNullOrEmpty() &&
+            isNovoEpisodioEmBreve = selosAtivos && !tmdb_proximo_episodio_data.isNullOrEmpty() &&
                 tmdb_proximo_episodio_data > hoje,
             logoUrl = logo_url
         )
@@ -2461,6 +2492,7 @@ class HomeActivity : AppCompatActivity() {
 
     override fun onResume() {
         super.onResume()
+        atualizarConfigSelos()
         try {
             lifecycleScope.launch(Dispatchers.Main) {
                 delay(400)
@@ -3017,4 +3049,25 @@ class HomeActivity : AppCompatActivity() {
     }
 
     private val Int.dp: Int get() = (this * resources.displayMetrics.density).toInt()
-}
+}             llBadge.visibility = View.VISIBLE
+                    }
+                    else -> {
+                        llBadge.visibility = View.GONE
+                    }
+                }
+            }
+
+            Glide.with(holder.itemView.context)
+                .asBitmap()
+                .load(item.streamIcon)
+                .override(160, 240)
+                .diskCacheStrategy(DiskCacheStrategy.ALL)
+                .dontAnimate()
+                .placeholder(R.drawable.ic_launcher)
+                .into(holder.ivPoster)
+
+            holder.itemView.setOnClickListener { onItemClick(item) }
+            holder.itemView.setOnFocusChangeListener { v, hasFocus ->
+                v.scaleX    = if (hasFocus) 1.08f else 1.0f
+                v.scaleY    = if (hasFocus) 1.08f else 1.0f
+                v
