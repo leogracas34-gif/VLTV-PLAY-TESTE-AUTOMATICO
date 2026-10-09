@@ -3049,25 +3049,4 @@ class HomeActivity : AppCompatActivity() {
     }
 
     private val Int.dp: Int get() = (this * resources.displayMetrics.density).toInt()
-}             llBadge.visibility = View.VISIBLE
-                    }
-                    else -> {
-                        llBadge.visibility = View.GONE
-                    }
-                }
-            }
-
-            Glide.with(holder.itemView.context)
-                .asBitmap()
-                .load(item.streamIcon)
-                .override(160, 240)
-                .diskCacheStrategy(DiskCacheStrategy.ALL)
-                .dontAnimate()
-                .placeholder(R.drawable.ic_launcher)
-                .into(holder.ivPoster)
-
-            holder.itemView.setOnClickListener { onItemClick(item) }
-            holder.itemView.setOnFocusChangeListener { v, hasFocus ->
-                v.scaleX    = if (hasFocus) 1.08f else 1.0f
-                v.scaleY    = if (hasFocus) 1.08f else 1.0f
-                v
+}
