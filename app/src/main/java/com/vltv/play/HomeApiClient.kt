@@ -52,7 +52,11 @@ object HomeApiClient {
     // "https://api.vltvplay.tech" (com Nginx+certbot) ou
     // "http://SEU_IP:3344" (direto na porta, sem domínio) — e a MESMA
     // APP_SHARED_KEY que você colocou no .env da VPS.
-    private const val BASE_URL = "http://51.222.26.119:3344"
+    // ✅ GATEWAY: o app NÃO fala mais direto com o IP:porta do backend. Passa
+    // pelo gateway (HTTPS), que troca o "painel:ID" pelo DNS real antes de
+    // repassar ao backend (rotas /home, /credits, /catalog...). Assim o IP da
+    // VPS some do app e o backend continua achando os dados de cada painel.
+    private const val BASE_URL = "https://tv.vltvplay.tech"
     private const val APP_SHARED_KEY = "L468983c@"
 
     // O upload demora mais porque o backend PROCESSA o TMDB inteiro

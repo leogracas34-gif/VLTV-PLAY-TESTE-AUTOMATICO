@@ -81,6 +81,11 @@ class HomeActivity : AppCompatActivity() {
     // ligado/desligado pelo painel /admin do gateway (GET /config). O último
     // valor fica guardado no aparelho; sem resposta do gateway, usa ele.
     @Volatile private var selosAtivos: Boolean = true
+    @Volatile private var seloNovidade: Boolean = true
+    @Volatile private var seloTop10: Boolean = true
+    @Volatile private var seloEpisodio: Boolean = true
+    @Volatile private var seloTemporada: Boolean = true
+    @Volatile private var seloEmBreve: Boolean = true
 
     private var currentProfile: String = "Padrao"
     private var currentProfileIcon: String? = null
@@ -245,11 +250,30 @@ class HomeActivity : AppCompatActivity() {
                 val base = getSharedPreferences("vltv_prefs", Context.MODE_PRIVATE)
                     .getString("dns", "")?.trim()?.removeSuffix("/") ?: ""
                 if (base.isEmpty()) return@launch
-                val novo = JSONObject(fetchUrlComTimeout("$base/config", 8000)).optBoolean("selos", true)
-                if (novo != selosAtivos) {
-                    selosAtivos = novo
-                    getSharedPreferences("vltv_home_prefs", Context.MODE_PRIVATE)
-                        .edit().putBoolean("selos_ativos", novo).apply()
+                val cfg = JSONObject(fetchUrlComTimeout("$base/config", 8000))
+                val nGeral = cfg.optBoolean("selos", true)
+                val nNovidade = cfg.optBoolean("novidade", true)
+                val nTop10 = cfg.optBoolean("top10", true)
+                val nEpisodio = cfg.optBoolean("episodio", true)
+                val nTemporada = cfg.optBoolean("temporada", true)
+                val nEmBreve = cfg.optBoolean("embreve", true)
+                val mudou = nGeral != selosAtivos || nNovidade != seloNovidade || nTop10 != seloTop10 ||
+                    nEpisodio != seloEpisodio || nTemporada != seloTemporada || nEmBreve != seloEmBreve
+                if (mudou) {
+                    selosAtivos = nGeral
+                    seloNovidade = nNovidade
+                    seloTop10 = nTop10
+                    seloEpisodio = nEpisodio
+                    seloTemporada = nTemporada
+                    seloEmBreve = nEmBreve
+                    getSharedPreferences("vltv_home_prefs", Context.MODE_PRIVATE).edit()
+                        .putBoolean("selos_ativos", nGeral)
+                        .putBoolean("selo_novidade", nNovidade)
+                        .putBoolean("selo_top10", nTop10)
+                        .putBoolean("selo_episodio", nEpisodio)
+                        .putBoolean("selo_temporada", nTemporada)
+                        .putBoolean("selo_embreve", nEmBreve)
+                        .apply()
                     withContext(Dispatchers.Main) {
                         if (!isFinishing && !isDestroyed) popularTelaDoRepositorio()
                     }
@@ -287,8 +311,14 @@ class HomeActivity : AppCompatActivity() {
             val windowInsetsController = WindowCompat.getInsetsController(window, window.decorView)
             windowInsetsController.isAppearanceLightStatusBars = false
 
-            selosAtivos = getSharedPreferences("vltv_home_prefs", Context.MODE_PRIVATE)
-                .getBoolean("selos_ativos", true)
+            getSharedPreferences("vltv_home_prefs", Context.MODE_PRIVATE).let { sp ->
+                selosAtivos = sp.getBoolean("selos_ativos", true)
+                seloNovidade = sp.getBoolean("selo_novidade", true)
+                seloTop10 = sp.getBoolean("selo_top10", true)
+                seloEpisodio = sp.getBoolean("selo_episodio", true)
+                seloTemporada = sp.getBoolean("selo_temporada", true)
+                seloEmBreve = sp.getBoolean("selo_embreve", true)
+            }
 
             setupSingleBanner()
             setupBottomNavigation()
@@ -1627,8 +1657,8 @@ class HomeActivity : AppCompatActivity() {
         name = limparNomeExibicao(name),
         streamIcon = stream_icon ?: "",
         isSerie = false,
-        isTop10 = is_top10 == 1,
-        isNovidade = selosAtivos && is_novidade == 1,
+        isTop10 = selosAtivos && seloTop10 && is_top10 == 1,
+        isNovidade = selosAtivos && seloNovidade && is_novidade == 1,
         logoUrl = logo_url
     )
 
@@ -1640,13 +1670,13 @@ class HomeActivity : AppCompatActivity() {
             name = limparNomeExibicao(name),
             streamIcon = cover ?: "",
             isSerie = true,
-            isTop10 = is_top10 == 1,
-            isNovidade = selosAtivos && is_novidade == 1,
-            isNovaTemporada = selosAtivos && is_nova_temporada == 1 && dentroDaJanela,
-            isNovoEpisodio = selosAtivos && is_novo_episodio == 1 && dentroDaJanela,
-            isNovaTemporadaEmBreve = selosAtivos && !tmdb_proxima_temporada_data.isNullOrEmpty() &&
+            isTop10 = selosAtivos && seloTop10 && is_top10 == 1,
+            isNovidade = selosAtivos && seloNovidade && is_novidade == 1,
+            isNovaTemporada = selosAtivos && seloTemporada && is_nova_temporada == 1 && dentroDaJanela,
+            isNovoEpisodio = selosAtivos && seloEpisodio && is_novo_episodio == 1 && dentroDaJanela,
+            isNovaTemporadaEmBreve = selosAtivos && seloEmBreve && !tmdb_proxima_temporada_data.isNullOrEmpty() &&
                 tmdb_proxima_temporada_data > hoje,
-            isNovoEpisodioEmBreve = selosAtivos && !tmdb_proximo_episodio_data.isNullOrEmpty() &&
+            isNovoEpisodioEmBreve = selosAtivos && seloEmBreve && !tmdb_proximo_episodio_data.isNullOrEmpty() &&
                 tmdb_proximo_episodio_data > hoje,
             logoUrl = logo_url
         )
