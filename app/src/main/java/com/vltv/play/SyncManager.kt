@@ -278,6 +278,11 @@ object SyncManager {
 
     private suspend fun executarSincronizacao(context: Context, dnsRaw: String, user: String, pass: String, forcar: Boolean = false) {
         val dns = dnsRaw
+        // ✅ GATEWAY: o backend (Top10/selos/catálogo) NÃO conhece o endereço do
+        // gateway (tv.vltvplay.tech) — ele precisa do "painel:ID" do cliente,
+        // que o gateway troca pelo DNS real antes de repassar ao backend.
+        // Se por algum motivo vier vazio, cai no dns de antes.
+        val dnsBackend = XtreamApi.dominioBackend(context)?.takeIf { it.isNotBlank() } ?: dns
         val db = AppDatabase.getDatabase(context)
         val palavrasProibidas = listOf("XXX", "PORN", "ADULTO", "SEXO", "EROTICO", "🔞", "PORNÔ")
         val t0 = System.currentTimeMillis()
@@ -366,7 +371,7 @@ object SyncManager {
                 scope.async {
                     try {
                         withTimeoutOrNull(10_000L) {
-                            aplicarPacoteInicial(db, dns, palavrasProibidas, vodsExistentes, seriesExistentes)
+                            aplicarPacoteInicial(db, dnsBackend, palavrasProibidas, vodsExistentes, seriesExistentes)
                         }
                     } catch (e: CancellationException) {
                         throw e
@@ -379,7 +384,7 @@ object SyncManager {
             var catalogoBackend: HomeApiClient.CatalogoBackend? = null
             if (localSemCatalogoCompleto) {
                 try {
-                    catalogoBackend = HomeApiClient.buscarCatalogo(dns)
+                    catalogoBackend = HomeApiClient.buscarCatalogo(dnsBackend)
                 } catch (e: Exception) {
                     e.printStackTrace()
                 }
@@ -505,7 +510,7 @@ object SyncManager {
             // ESTE app encontra um painel que o backend ainda não conhece,
             // exatamente como o comentário original pretendia.
             val prefsBackend = context.getSharedPreferences("vltv_backend_sync", Context.MODE_PRIVATE)
-            val chaveJaEnviou = "catalogo_enviado_" + dns.hashCode()
+            val chaveJaEnviou = "catalogo_enviado_" + dnsBackend.hashCode()
             val jaEnviouCatalogoAntes = prefsBackend.getBoolean(chaveJaEnviou, false)
 
             var aplicadoPeloBackend = false
@@ -514,7 +519,7 @@ object SyncManager {
                 // de novo em toda abertura do app (cada tentativa podia
                 // segurar a Home por até 40s antes do buscarHome). Só
                 // volta a tentar depois de 6 horas.
-                val chaveUltimaTentativa = "ultima_tentativa_envio_" + dns.hashCode()
+                val chaveUltimaTentativa = "ultima_tentativa_envio_" + dnsBackend.hashCode()
                 val ultimaTentativa = prefsBackend.getLong(chaveUltimaTentativa, 0L)
                 val podeTentarEnvio = System.currentTimeMillis() - ultimaTentativa > 6 * 60 * 60 * 1000L
 
@@ -530,22 +535,22 @@ object SyncManager {
                     // backend JÁ tem esse painel pronto (agora ele guarda por
                     // servidor, então outro DNS/cliente do mesmo servidor já
                     // pode ter enviado). Se tiver, não faz upload nenhum.
-                    resultadoBackend = HomeApiClient.buscarHome(dns)
+                    resultadoBackend = HomeApiClient.buscarHome(dnsBackend)
                     if (resultadoBackend != null && temDados(resultadoBackend)) {
                         prefsBackend.edit().putBoolean(chaveJaEnviou, true).apply()
                     } else {
                         prefsBackend.edit().putLong(chaveUltimaTentativa, System.currentTimeMillis()).apply()
                         // ✅ CORRIGIDO: só marca "já enviei" se o backend realmente
                         // recebeu (enviarCatalogo devolve false em timeout/erro).
-                        val enviou = HomeApiClient.enviarCatalogo(dns, vodsCompletos, seriesCompletos)
+                        val enviou = HomeApiClient.enviarCatalogo(dnsBackend, vodsCompletos, seriesCompletos)
                         if (enviou) {
                             prefsBackend.edit().putBoolean(chaveJaEnviou, true).apply()
                         }
                         logTempo("enviarCatalogo (só roda na 1ª vez que o backend vê esse painel)", "upload")
-                        resultadoBackend = HomeApiClient.buscarHome(dns)
+                        resultadoBackend = HomeApiClient.buscarHome(dnsBackend)
                     }
                 } else {
-                    resultadoBackend = HomeApiClient.buscarHome(dns)
+                    resultadoBackend = HomeApiClient.buscarHome(dnsBackend)
                 }
                 logTempo("buscarHome (Top10/Novidades/selos prontos do backend)", "buscarHome")
 
